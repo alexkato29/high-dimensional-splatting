@@ -91,6 +91,9 @@ class ColmapDataset:
 			points.append(point3D.xyz)
 			colors.append(point3D.color / 255.0)
 
+		if len(points) != len(colors):
+			raise ValueError("Error loading data, points and colors have different lengths.")
+
 		return PointCloud(
 			points=np.array(points, dtype=np.float32),
 			colors=np.array(colors, dtype=np.float32)
