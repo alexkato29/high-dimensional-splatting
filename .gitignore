@@ -1,5 +1,7 @@
 # User Added
 data/
+.DS_Store
+notes.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

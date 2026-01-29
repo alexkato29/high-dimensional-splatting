@@ -9,7 +9,9 @@ license = {text = "MIT"}
 readme = "README.md"
 requires-python = "~3.12"
 dependencies = [
-    "torch ~=2.10.0"
+    "torch ~=2.10.0",
+    "pycolmap ~=3.13.0",
+    "pillow ~= 12.1.0"
 ]
 
 
