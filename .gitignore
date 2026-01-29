@@ -2,6 +2,8 @@
 data/
 .DS_Store
 notes.md
+tests/
+pytest.ini
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
