@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 from pathlib import Path
 import pycolmap
@@ -17,11 +18,11 @@ class RawImage:
 	height: Image height
 	"""
 	uid: int
-	R: np.ndarray
-	t: np.ndarray
+	R: torch.Tensor
+	t: torch.Tensor
 	FovX: float
 	FovY: float
-	image: np.ndarray
+	image: torch.Tensor
 	width: int
 	height: int
 
@@ -63,11 +64,12 @@ class ColmapDataset:
 				raise ValueError(f"Camera type {cam.model.name} not supported.")
 
 			pose: pycolmap.Rigid3d = image.cam_from_world()
-			R: np.ndarray = pose.rotation.matrix()
-			t: np.ndarray = pose.translation 
+			R: torch.Tensor = torch.tensor(pose.rotation.matrix(), dtype=torch.float32).cuda()
+			t: torch.Tensor = torch.tensor(pose.translation, dtype=torch.float32).cuda()
 
 			image_path: Path = self.images_path / image.name
-			image_array: np.ndarray = np.array(Image.open(image_path))
+			image_array: np.ndarray = np.array(Image.open(image_path)).astype(np.float32) / 255.0
+			image_tensor: torch.Tensor = torch.tensor(image_array).cuda()
 
 			raw_image = RawImage(
 				uid=image_id,
@@ -75,7 +77,7 @@ class ColmapDataset:
 				t=t,
 				FovX=focal_to_fov(fx, cam.width),
 				FovY=focal_to_fov(fy, cam.height),
-				image=image_array,
+				image=image_tensor,
 				width=cam.width,
 				height=cam.height
 			)

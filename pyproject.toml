@@ -1,5 +1,5 @@
 [project]
-name = "gaussian-splatting"
+name = "gaussian_splatting"
 version = "0.1.0"
 description = "Minimal implementation of 3DGS"
 authors = [
@@ -24,6 +24,3 @@ dev = [
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
-
-[tool.poetry]
-package-mode = false

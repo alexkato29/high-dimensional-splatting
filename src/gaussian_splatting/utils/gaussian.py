@@ -1,8 +1,10 @@
+from typing import Any
 from scipy.spatial import KDTree
 import numpy as np
 import torch
 import torch.nn as nn
-from utils.dataset import PointCloud
+from gaussian_splatting.config import TrainingParams
+from gaussian_splatting.utils.dataset import PointCloud
 
 
 class GaussianModel(nn.Module):
@@ -10,9 +12,10 @@ class GaussianModel(nn.Module):
 		super().__init__()
 
 		self._xyz: nn.Parameter
-		self._scales: nn.Parameter
+		self._scaling_vecs: nn.Parameter
 		self._quaternions: nn.Parameter
 		self._opacities: nn.Parameter
+		# The actual paper uses Spherical Harmonics, but for simplicity I will add that last
 		self._rgb: nn.Parameter
 
 		self._initialize_from_point_cloud(point_cloud)
@@ -27,7 +30,7 @@ class GaussianModel(nn.Module):
 		dist: torch.Tensor = torch.clamp_min(self._compute_nearest_neighbor_dist(cpu_xyz), 1e-7)
 		# This makes shape [d1, d2, ...] -> [[d1.1, d1.2, d1.3], [d2.1, d2.2, d2.3], ...]
 		scales: torch.Tensor = torch.log(dist).unsqueeze(-1).repeat(1, 3)
-		self._scales = nn.Parameter(scales.cuda(), requires_grad=True)
+		self._scaling_vecs = nn.Parameter(scales.cuda(), requires_grad=True)
 
 		self._xyz = nn.Parameter(
 			cpu_xyz.cuda(),
@@ -64,7 +67,7 @@ class GaussianModel(nn.Module):
 
 	@property
 	def scales(self) -> torch.Tensor:
-		return torch.exp(self._scales)
+		return torch.exp(self._scaling_vecs)
 
 	@property
 	def quaternions(self) -> torch.Tensor:
@@ -77,3 +80,15 @@ class GaussianModel(nn.Module):
 	@property
 	def rgb(self) -> torch.Tensor:
 		return torch.clamp(self._rgb, 0.0, 1.0)
+
+	def get_optimizer_params(self) -> list[dict[str, Any]]:
+		params: TrainingParams = TrainingParams()
+		return [
+			{'params': [self._xyz], 'lr': params.position_lr, "name": "xyz"},
+			{'params': [self._scaling_vecs], 'lr': params.scaling_lr, "name": "scaling_vecs"},
+			{'params': [self._quaternions], 'lr': params.rotation_lr, "name": "quaternions"},
+			{'params': [self._opacities], 'lr': params.opacity_lr, "name": "opacities"},
+			{'params': [self._rgb], 'lr': params.rgb_lr, "name": "rgb"}
+		]
+
+	# CRITICAL TODO: I need to be able to split and prune gaussians.
