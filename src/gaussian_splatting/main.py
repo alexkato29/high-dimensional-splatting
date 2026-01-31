@@ -66,7 +66,7 @@ def train(data_path: str) -> None:
 	for iteration in range(params.iterations):
 		start: float = time.time()
 		image: RawImage = random.choice(dataset.images)
-		gt_image: torch.Tensor = image.image
+		gt_image: torch.Tensor = image.load_image(device='cuda' if torch.cuda.is_available() else 'cpu')
 
 		rendered_image = render(image, model)
 

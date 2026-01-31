@@ -52,10 +52,14 @@ class Camera:
 class RawImage(Camera):
 	"""
 	uid: Unique identifier
-	image: Loaded image (H, W, C)
+	image_path: Path to image file
 	"""
 	uid: int
-	image: torch.Tensor
+	image_path: Path
+
+	def load_image(self, device: str = 'cuda') -> torch.Tensor:
+		image_array = np.array(Image.open(self.image_path)).astype(np.float32) / 255.0
+		return torch.tensor(image_array, device=device)
 
 
 @dataclass
@@ -100,8 +104,6 @@ class ColmapDataset:
 			t: torch.Tensor = torch.tensor(pose.translation, dtype=torch.float32).to(self.device)
 
 			image_path: Path = self.images_path / image.name
-			image_array: np.ndarray = np.array(Image.open(image_path)).astype(np.float32) / 255.0
-			image_tensor: torch.Tensor = torch.tensor(image_array).to(self.device)
 
 			raw_image = RawImage(
 				uid=image_id,
@@ -109,7 +111,7 @@ class ColmapDataset:
 				t=t,
 				FovX=focal_to_fov(fx, cam.width),
 				FovY=focal_to_fov(fy, cam.height),
-				image=image_tensor,
+				image_path=image_path,
 				width=cam.width,
 				height=cam.height
 			)
