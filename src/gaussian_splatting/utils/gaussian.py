@@ -8,7 +8,7 @@ from gaussian_splatting.utils.dataset import PointCloud
 
 
 class GaussianModel(nn.Module):
-	def __init__(self, point_cloud: PointCloud, device: str = None):
+	def __init__(self, point_cloud: PointCloud, device: str | None = None):
 		super().__init__()
 
 		self._xyz: nn.Parameter

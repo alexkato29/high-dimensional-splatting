@@ -31,20 +31,20 @@ class Camera:
 		return W
 
 	@property
-	def fx(self):
+	def focal_x(self):
 		return self.width / (2.0 * torch.tan(torch.tensor(self.FovX * 0.5, device=self.R.device)))
 
 	@property
-	def fy(self):
+	def focal_y(self):
 		return self.height / (2.0 * torch.tan(torch.tensor(self.FovY * 0.5, device=self.R.device)))
 
 	@property
-	def cx(self):
-		return (self.width - 1) * 0.5
+	def c_x(self):
+		return self.width * 0.5
 
 	@property
-	def cy(self):
-		return (self.height - 1) * 0.5
+	def c_y(self):
+		return self.height * 0.5
 
 
 
@@ -73,7 +73,7 @@ def focal_to_fov(focal: float, pixels: float) -> float:
 
 
 class ColmapDataset:
-	def __init__(self, data_path: str, device: str = None):
+	def __init__(self, data_path: str, device: str | None = None):
 		self.data_path: Path = Path(data_path)
 		self.sparse_path: Path = self.data_path / "sparse" / "0"
 		self.images_path: Path = self.data_path / "images"
