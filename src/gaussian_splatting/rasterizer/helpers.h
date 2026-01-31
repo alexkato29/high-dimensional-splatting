@@ -33,6 +33,24 @@ __device__ inline bool is_off_screen(float2 p, int width, int height, int margin
 			p.y < -margin || p.y >= height + margin);
 }
 
+__device__ inline float evaluate_gaussian_2d(float2 pixel, float2 mean, float3 cov) {
+	float dx = pixel.x - mean.x;
+	float dy = pixel.y - mean.y;
+
+	float det = cov.x * cov.z - cov.y * cov.y;
+	if (det == 0.0f) return 0.0f;
+
+	float det_inv = 1.0f / det;
+	float cov_inv_xx = cov.z * det_inv;
+	float cov_inv_xy = -cov.y * det_inv;
+	float cov_inv_yy = cov.x * det_inv;
+
+	float mahalanobis = dx * (cov_inv_xx * dx + cov_inv_xy * dy) +
+						dy * (cov_inv_xy * dx + cov_inv_yy * dy);
+
+	return expf(-0.5f * mahalanobis);
+}
+
 __device__ inline void quat_to_rotmat(float4 q, float* R) {
 	float w = q.x, x = q.y, y = q.z, z = q.w;
 

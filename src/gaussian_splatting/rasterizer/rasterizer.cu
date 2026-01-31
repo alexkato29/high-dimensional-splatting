@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
 #include "helpers.h"
 
 inline void check_cuda_error(const char* kernel_name) {
@@ -83,8 +85,56 @@ __global__ void project_gaussians(
 	);
 
 	((float3*)cov2D)[idx] = cov2D_out;
+	// TODO: Optionally cull more gaussians...
+}
 
-	// Step 3: One last proper cull to remove gaussians whose 99% CI is confirmed not on screen
+__global__ void render_gaussians(
+	int num_gaussians,
+	const int* sorted_indices,
+	const float* means2D,
+	const float* cov2D,
+	const float* colors,
+	const float* opacities,
+	int image_width,
+	int image_height,
+	float* output
+) {
+	int px = blockIdx.x * blockDim.x + threadIdx.x;
+	int py = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (px >= image_width || py >= image_height) return;
+
+	float2 pixel = make_float2(px + 0.5f, py + 0.5f);
+
+	float3 accumulated_color = make_float3(0.0f, 0.0f, 0.0f);
+	float transmittance = 1.0f;
+
+	for (int i = 0; i < num_gaussians; i++) {
+		int idx = sorted_indices[i];
+
+		float2 mean = ((float2*)means2D)[idx];
+		float3 cov = ((float3*)cov2D)[idx];
+		float3 color = ((float3*)colors)[idx];
+		float opacity = opacities[idx];
+
+		float weight = evaluate_gaussian_2d(pixel, mean, cov);
+		float alpha = opacity * weight;
+
+		if (alpha < 1e-4f) continue;
+
+		accumulated_color.x += alpha * transmittance * color.x;
+		accumulated_color.y += alpha * transmittance * color.y;
+		accumulated_color.z += alpha * transmittance * color.z;
+
+		transmittance *= (1.0f - alpha);
+
+		if (transmittance < 1e-3f) break;
+	}
+
+	int pixel_idx = py * image_width + px;
+	output[pixel_idx * 3 + 0] = accumulated_color.x;
+	output[pixel_idx * 3 + 1] = accumulated_color.y;
+	output[pixel_idx * 3 + 2] = accumulated_color.z;
 }
 
 torch::Tensor rasterize(
@@ -141,13 +191,42 @@ torch::Tensor rasterize(
 	);
 	check_cuda_error("project_gaussians");
 
-	// Step 2: sort gaussians per tile
-	// Step 3: alpha blend
+	// Step 2: sort gaussians by depth
+	torch::Tensor indices = torch::arange(num_gaussians, options.dtype(torch::kInt32));
+	int* indices_ptr = indices.data_ptr<int>();
+
+	thrust::device_ptr<float> depth_ptr(depths_ptr);
+	thrust::device_ptr<int> idx_ptr(indices_ptr);
+
+	thrust::sort_by_key(depth_ptr, depth_ptr + num_gaussians, idx_ptr);
+
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		throw std::runtime_error(
+			std::string("Thrust sort error: ") + cudaGetErrorString(err)
+		);
+	}
+
+	float* output_ptr = output.data_ptr<float>();
+
 	dim3 block(16, 16);
 	dim3 grid(
 		(image_width + block.x - 1) / block.x,
-		(image_height + block.y - 1) / block.y 
+		(image_height + block.y - 1) / block.y
 	);
+
+	render_gaussians<<<grid, block>>>(
+		num_gaussians,
+		indices_ptr,
+		means2D_ptr,
+		cov2D_ptr,
+		colors_ptr,
+		opacities_ptr,
+		image_width,
+		image_height,
+		output_ptr
+	);
+	check_cuda_error("render_gaussians");
 
 	return output;
 }
