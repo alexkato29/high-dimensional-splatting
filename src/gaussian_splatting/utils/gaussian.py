@@ -8,15 +8,15 @@ from gaussian_splatting.utils.dataset import PointCloud
 
 
 class GaussianModel(nn.Module):
-	def __init__(self, point_cloud: PointCloud):
+	def __init__(self, point_cloud: PointCloud, device: str = None):
 		super().__init__()
 
 		self._xyz: nn.Parameter
 		self._scales: nn.Parameter
 		self._quaternions: nn.Parameter
 		self._opacities: nn.Parameter
-		# The actual paper uses Spherical Harmonics, but for simplicity I will add that last
 		self._rgb: nn.Parameter
+		self.device: str = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
 
 		self._initialize_from_point_cloud(point_cloud)
 
@@ -30,25 +30,25 @@ class GaussianModel(nn.Module):
 		dist: torch.Tensor = torch.clamp_min(self._compute_nearest_neighbor_dist(cpu_xyz), 1e-7)
 		# This makes shape [d1, d2, ...] -> [[d1.1, d1.2, d1.3], [d2.1, d2.2, d2.3], ...]
 		scales: torch.Tensor = torch.log(dist).unsqueeze(-1).repeat(1, 3)
-		self._scales = nn.Parameter(scales.cuda(), requires_grad=True)
+		self._scales = nn.Parameter(scales.to(self.device), requires_grad=True)
 
 		self._xyz = nn.Parameter(
-			cpu_xyz.cuda(),
+			cpu_xyz.to(self.device),
 			requires_grad=True
 		)
 
 		self._quaternions = nn.Parameter(
-			torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32).repeat(num_points, 1).cuda(),
+			torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32).repeat(num_points, 1).to(self.device),
 			requires_grad=True
 		)
 
 		opacities: torch.Tensor = self._inverse_sigmoid(
 			0.1 * torch.ones((num_points, 1), dtype=torch.float32)
 		)
-		self._opacities = nn.Parameter(opacities.cuda(), requires_grad=True)
+		self._opacities = nn.Parameter(opacities.to(self.device), requires_grad=True)
 
 		self._rgb = nn.Parameter(
-			torch.tensor(point_cloud.colors, dtype=torch.float32).cuda(),
+			torch.tensor(point_cloud.colors, dtype=torch.float32).to(self.device),
 			requires_grad=True
 		)
 

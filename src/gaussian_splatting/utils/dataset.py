@@ -6,51 +6,56 @@ from PIL import Image
 from dataclasses import dataclass
 
 @dataclass
-class RawImage:
+class Camera:
 	"""
-	uid: Unique identifier
 	R: Camera rotation matrix
 	t: Camera translation vector
 	FovX: Horizontal fov (radians)
 	FovY: Vertical fov (radians)
-	image: Loaded image (H, W, C)
 	width: Image width
 	height: Image height
 	"""
-	uid: int
 	R: torch.Tensor
 	t: torch.Tensor
 	FovX: float
 	FovY: float
-	image: torch.Tensor
 	width: int
 	height: int
 
 	@property
-	def world_view_transform(self) -> torch.Tensor:
+	def world_to_camera_matrix(self) -> torch.Tensor:
 		W = torch.zeros((4, 4), device=self.R.device, dtype=torch.float32)
-		W[:3, :3] = self.R.T
+		W[:3, :3] = self.R
 		W[:3, 3] = self.t
 		W[3, 3] = 1.0
 		return W
 
 	@property
-	def projection_matrix(self) -> torch.Tensor:
-		tanfovx = torch.tan(torch.tensor(self.FovX / 2.0))
-		tanfovy = torch.tan(torch.tensor(self.FovY / 2.0))
-		znear, zfar = 0.01, 100.0
-
-		P = torch.zeros((4, 4), device=self.R.device, dtype=torch.float32)
-		P[0, 0] = 1.0 / tanfovx
-		P[1, 1] = 1.0 / tanfovy
-		P[2, 2] = -(zfar + znear) / (zfar - znear)
-		P[2, 3] = -2.0 * zfar * znear / (zfar - znear)
-		P[3, 2] = -1.0
-		return P
+	def fx(self):
+		return self.width / (2.0 * torch.tan(torch.tensor(self.FovX * 0.5, device=self.R.device)))
 
 	@property
-	def camera_center(self) -> torch.Tensor:
-		return -self.R.T @ self.t
+	def fy(self):
+		return self.height / (2.0 * torch.tan(torch.tensor(self.FovY * 0.5, device=self.R.device)))
+
+	@property
+	def cx(self):
+		return (self.width - 1) * 0.5
+
+	@property
+	def cy(self):
+		return (self.height - 1) * 0.5
+
+
+
+@dataclass
+class RawImage(Camera):
+	"""
+	uid: Unique identifier
+	image: Loaded image (H, W, C)
+	"""
+	uid: int
+	image: torch.Tensor
 
 
 @dataclass
@@ -68,11 +73,12 @@ def focal_to_fov(focal: float, pixels: float) -> float:
 
 
 class ColmapDataset:
-	def __init__(self, data_path: str):
+	def __init__(self, data_path: str, device: str = None):
 		self.data_path: Path = Path(data_path)
 		self.sparse_path: Path = self.data_path / "sparse" / "0"
 		self.images_path: Path = self.data_path / "images"
-		
+		self.device: str = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+
 		self.reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction(str(self.sparse_path))
 
 		self.images: list[RawImage] = self._load_cameras()
@@ -90,12 +96,12 @@ class ColmapDataset:
 				raise ValueError(f"Camera type {cam.model.name} not supported.")
 
 			pose: pycolmap.Rigid3d = image.cam_from_world()
-			R: torch.Tensor = torch.tensor(pose.rotation.matrix(), dtype=torch.float32).cuda()
-			t: torch.Tensor = torch.tensor(pose.translation, dtype=torch.float32).cuda()
+			R: torch.Tensor = torch.tensor(pose.rotation.matrix(), dtype=torch.float32).to(self.device)
+			t: torch.Tensor = torch.tensor(pose.translation, dtype=torch.float32).to(self.device)
 
 			image_path: Path = self.images_path / image.name
 			image_array: np.ndarray = np.array(Image.open(image_path)).astype(np.float32) / 255.0
-			image_tensor: torch.Tensor = torch.tensor(image_array).cuda()
+			image_tensor: torch.Tensor = torch.tensor(image_array).to(self.device)
 
 			raw_image = RawImage(
 				uid=image_id,
