@@ -26,6 +26,32 @@ class RawImage:
 	width: int
 	height: int
 
+	@property
+	def world_view_transform(self) -> torch.Tensor:
+		W = torch.zeros((4, 4), device=self.R.device, dtype=torch.float32)
+		W[:3, :3] = self.R.T
+		W[:3, 3] = self.t
+		W[3, 3] = 1.0
+		return W
+
+	@property
+	def projection_matrix(self) -> torch.Tensor:
+		tanfovx = torch.tan(torch.tensor(self.FovX / 2.0))
+		tanfovy = torch.tan(torch.tensor(self.FovY / 2.0))
+		znear, zfar = 0.01, 100.0
+
+		P = torch.zeros((4, 4), device=self.R.device, dtype=torch.float32)
+		P[0, 0] = 1.0 / tanfovx
+		P[1, 1] = 1.0 / tanfovy
+		P[2, 2] = -(zfar + znear) / (zfar - znear)
+		P[2, 3] = -2.0 * zfar * znear / (zfar - znear)
+		P[3, 2] = -1.0
+		return P
+
+	@property
+	def camera_center(self) -> torch.Tensor:
+		return -self.R.T @ self.t
+
 
 @dataclass
 class PointCloud:
