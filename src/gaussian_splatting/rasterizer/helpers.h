@@ -150,3 +150,25 @@ __device__ inline float3 project_cov_matrix(
 
 	return make_float3(xx + 0.3f, xy, yy + 0.3f);
 }
+
+__device__ inline float compute_radius_from_cov2D(float3 cov) {
+	// We are solving the characterisitc polynomial here
+	float trace = cov.x + cov.z;
+	float det = cov.x * cov.z - cov.y * cov.y;
+
+	float discriminant = trace * trace - 4.0f * det;
+	// In theory, the covariance is PSD so the discriminant should never be <0...
+	// discriminant = fmaxf(discriminant, 0.0f);
+
+	float max_eigenvalue = 0.5f * (trace + sqrtf(discriminant));
+
+	// This can be tuned, but 3 standard deviations ~99.7% from empirical rule
+	return 3.0f * sqrtf(max_eigenvalue);
+}
+
+__device__ inline int2 pixel_to_tile(float2 pixel, int tile_size) {
+	return make_int2(
+		static_cast<int>(pixel.x) / tile_size,
+		static_cast<int>(pixel.y) / tile_size
+	);
+}

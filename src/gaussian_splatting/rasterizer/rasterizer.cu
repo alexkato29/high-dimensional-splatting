@@ -4,6 +4,8 @@
 #include <string>
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
+#include <thrust/sequence.h>
+#include <cub/device/device_radix_sort.cuh>
 #include "helpers.h"
 
 inline void check_cuda_error(const char* kernel_name) {
@@ -38,9 +40,15 @@ __global__ void project_gaussians(
 	float c_y,
 	int image_width,
 	int image_height,
+	int tile_size,
+	int num_tiles_x,
+	int num_tiles_y,
 	float* means2D,
 	float* cov2D,
-	float* depths
+	float* depths,
+	int2* tile_min,
+	int2* tile_max,
+	int* tiles_touched
 ) {
 	// Step 1: We must project the gaussian mean to the screen space (u, v)
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -53,6 +61,9 @@ __global__ void project_gaussians(
 	// This causes warp divergence, so we will have to see if it impacts perf
 	if (is_behind_camera(p_cam.z, 0.2f)) {
 		depths[idx] = 1e10f;
+		tile_min[idx] = make_int2(0, 0);
+		tile_max[idx] = make_int2(0, 0);
+		tiles_touched[idx] = 0;
 		return;
 	}
 
@@ -60,6 +71,9 @@ __global__ void project_gaussians(
 
 	if (is_off_screen(uv, image_width, image_height)) {
 		depths[idx] = 1e10f;
+		tile_min[idx] = make_int2(0, 0);
+		tile_max[idx] = make_int2(0, 0);
+		tiles_touched[idx] = 0;
 		return;
 	}
 
@@ -85,12 +99,87 @@ __global__ void project_gaussians(
 	);
 
 	((float3*)cov2D)[idx] = cov2D_out;
-	// TODO: Optionally cull more gaussians...
+
+	float radius = compute_radius_from_cov2D(cov2D_out);
+
+	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
+	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
+
+	int2 tile_min_coords = pixel_to_tile(min_pixel, tile_size);
+	int2 tile_max_coords = pixel_to_tile(max_pixel, tile_size);
+
+	tile_min_coords.x = max(0, tile_min_coords.x);
+	tile_min_coords.y = max(0, tile_min_coords.y);
+	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
+	tile_max_coords.y = min(num_tiles_y - 1, tile_max_coords.y);
+
+	tile_min[idx] = tile_min_coords;
+	tile_max[idx] = tile_max_coords;
+
+	tiles_touched[idx] = (tile_max_coords.x - tile_min_coords.x + 1) * (tile_max_coords.y - tile_min_coords.y + 1);
+}
+
+
+__global__ void duplicate_gaussians(
+	int num_gaussians,
+	const int* offsets,
+	const int2* tile_min,
+	const int2* tile_max,
+	const float* depths,
+	int tile_cols,
+	uint64_t* tiled_gaussian_keys,
+	int* tiled_gaussian_values
+) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= num_gaussians) return;
+
+	int offset = offsets[idx];
+	int2 tile_min_coords = tile_min[idx];
+	int2 tile_max_coords = tile_max[idx];
+	float depth = depths[idx];
+	uint32_t depth_bits = *((uint32_t*)&depth);
+
+	int count = 0;
+	for (int y = tile_min_coords.y; y <= tile_max_coords.y; y++) {
+		for (int x = tile_min_coords.x; x <= tile_max_coords.x; x++) {
+			int tile_idx = y * tile_cols + x;
+			uint64_t key = ((uint64_t)tile_idx << 32) | depth_bits;
+			tiled_gaussian_keys[offset + count] = key;
+			tiled_gaussian_values[offset + count] = idx;
+			count++;
+		}
+	}
+}
+
+__global__ void identify_tile_ranges(
+	int num_duplicates,
+	const uint64_t* sorted_keys,
+	uint2* tile_ranges
+) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= num_duplicates) return;
+
+	uint64_t key = sorted_keys[idx];
+	uint32_t curr_tile = key >> 32;
+
+	if (idx == 0) {
+		tile_ranges[curr_tile].x = 0;
+	} else {
+		uint32_t prev_tile = sorted_keys[idx - 1] >> 32;
+		if (curr_tile != prev_tile) {
+			tile_ranges[prev_tile].y = idx;
+			tile_ranges[curr_tile].x = idx;
+		}
+	}
+
+	if (idx == num_duplicates - 1) {
+		tile_ranges[curr_tile].y = num_duplicates;
+	}
 }
 
 __global__ void render_gaussians(
-	int num_gaussians,
-	const int* sorted_indices,
+	const uint2* tile_ranges,
+	const int* tiled_gaussian_values_sorted,
 	const float* means2D,
 	const float* cov2D,
 	const float* colors,
@@ -101,6 +190,7 @@ __global__ void render_gaussians(
 ) {
 	int px = blockIdx.x * blockDim.x + threadIdx.x;
 	int py = blockIdx.y * blockDim.y + threadIdx.y;
+	int tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
 
 	if (px >= image_width || py >= image_height) return;
 
@@ -109,8 +199,12 @@ __global__ void render_gaussians(
 	float3 accumulated_color = make_float3(0.0f, 0.0f, 0.0f);
 	float transmittance = 1.0f;
 
-	for (int i = 0; i < num_gaussians; i++) {
-		int idx = sorted_indices[i];
+	uint2 range = tile_ranges[tile_idx];
+	int start_idx = range.x;
+	int end_idx = range.y;
+
+	for (int i = start_idx; i < end_idx; i++) {
+		int idx = tiled_gaussian_values_sorted[i];
 
 		float2 mean = ((float2*)means2D)[idx];
 		float3 cov = ((float3*)cov2D)[idx];
@@ -151,26 +245,39 @@ torch::Tensor rasterize(
 	int image_width,
 	int image_height
 ) {
+	const int TILE_SIZE = 16;
+
 	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 	torch::Tensor output = torch::zeros({image_height, image_width, 3}, options);
 
 	int num_gaussians = means3D.size(0);
+	int num_tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
+	int num_tiles_y = (image_height + TILE_SIZE - 1) / TILE_SIZE;
 
-	// Covariance matrices are symmetric, so we can store 3 elements for 2D and 6 for 3D
-	torch::Tensor means2D = torch::zeros({num_gaussians, 2}, options);
-	torch::Tensor cov2D = torch::zeros({num_gaussians, 3}, options);
-	torch::Tensor depths = torch::zeros({num_gaussians}, options);
-
+	// These came from python and thus are torch::Tensor types
 	float* means3D_ptr = means3D.data_ptr<float>();
 	float* scales_ptr = scales.data_ptr<float>();
 	float* quaternions_ptr = quaternions.data_ptr<float>();
 	float* opacities_ptr = opacities.data_ptr<float>();
 	float* colors_ptr = colors.data_ptr<float>();
 	float* world_to_cam_matrix_ptr = world_to_cam_matrix.data_ptr<float>();
-	float* means2D_ptr = means2D.data_ptr<float>();
-	float* cov2D_ptr = cov2D.data_ptr<float>();
-	float* depths_ptr = depths.data_ptr<float>();
 
+	// We just need the output to be a torch tensor, but the rest can be regular dtypes
+	float* means2D_ptr;
+	float* cov2D_ptr;
+	float* depths_ptr;
+	int2* tile_min_ptr;
+	int2* tile_max_ptr;
+	int* tiles_touched_ptr;
+
+	cudaMalloc(&means2D_ptr, num_gaussians * 2 * sizeof(float));
+	cudaMalloc(&cov2D_ptr, num_gaussians * 3 * sizeof(float));
+	cudaMalloc(&depths_ptr, num_gaussians * sizeof(float));
+	cudaMalloc(&tile_min_ptr, num_gaussians * sizeof(int2));
+	cudaMalloc(&tile_max_ptr, num_gaussians * sizeof(int2));
+	cudaMalloc(&tiles_touched_ptr, num_gaussians * sizeof(int));
+
+	// Step 1: Project gaussians from 3D world space to 2D screen space
 	int threads = 256;
 	int blocks = (num_gaussians + threads - 1) / threads;
 	project_gaussians<<<blocks, threads>>>(
@@ -185,39 +292,152 @@ torch::Tensor rasterize(
 		c_y,
 		image_width,
 		image_height,
+		TILE_SIZE,
+		num_tiles_x,
+		num_tiles_y,
 		means2D_ptr,
 		cov2D_ptr,
-		depths_ptr
+		depths_ptr,
+		tile_min_ptr,
+		tile_max_ptr,
+		tiles_touched_ptr
 	);
 	check_cuda_error("project_gaussians");
 
-	// Step 2: sort gaussians by depth
-	torch::Tensor indices = torch::arange(num_gaussians, options.dtype(torch::kInt32));
-	int* indices_ptr = indices.data_ptr<int>();
+	/*
+	Step 2: Sort gaussians by depth per tile.
 
-	thrust::device_ptr<float> depth_ptr(depths_ptr);
-	thrust::device_ptr<int> idx_ptr(indices_ptr);
+	Ok, this part is a bit confusing so buckle up. To render a pixel, we need to know which gaussians influence it.
+	Duh. It also needs to be in depth order since we render front to back.
 
-	thrust::sort_by_key(depth_ptr, depth_ptr + num_gaussians, idx_ptr);
+	Naively: you globally sort all the gaussians by depth. Then your renderer, for each pixel, goes through all 
+	gaussians front to back to compute their impact. That is painfully slow. 4k image res * 50k gaussians is
+	414 BILLION comparisons. I actually did that at first, and it took about 6 seconds to do one forward pass.
 
-	cudaError_t err = cudaGetLastError();
-	if (err != cudaSuccess) {
-		throw std::runtime_error(
-			std::string("Thrust sort error: ") + cudaGetErrorString(err)
-		);
-	}
+	But, pixels should only check gaussians that actually matter (e.g., top left isn't checking a bottom right
+	gaussian). Then each pixel might only be checking tens of gaussians. Not tens of thousands. We do this by
+	tiling the image and, per tile, checking what gaussians actually overlap it. Great, that sounds faster. How
+	does it happen?
 
-	float* output_ptr = output.data_ptr<float>();
+	The end goal: have some list tiled_gaussian_ids_sorted that contains gaussiand ids like:
+	[tile0_depth0.1_gaussian123, tile0_depth1.5_gaussian456, ..., tileK_depth23.1_gaussian789]
+	sorted first by tile, then by depth. Only gaussians that touch the tile should be in the list. In this way, 
+	we've basically created per tile gaussian lists. Then, we may have another list tiled_ranges such that 
+	tiled_ranges[tile_idx] tells us the start and end index in tiled_gaussian_ids_sorted that we need to check. 
+	If we can have these two things, then we can check only	relevant gaussians within each tile.
 
-	dim3 block(16, 16);
-	dim3 grid(
-		(image_width + block.x - 1) / block.x,
-		(image_height + block.y - 1) / block.y
+	So how do we get those two lists? Like this (note that gaussian ID/GID just refers to the idx of the gaussian
+	in means2D and cov2D):
+	0. We know each gaussian touches tiles_touched[GID] and all times in a bounding box from tile_min[GID] to
+	tile_max[GID].
+
+	1. We compute a list offsets that is a prefix sum of tiles_touched. We also compute total_duplicates to be
+	the sum of tiles_touched (or more efficiently, offsets[-1] + tiles_touched[-1]).
+
+	2. We allocate keys and values lists of length total_duplicates that will store the key of a gaussian (see
+	the next step) and the value, which will be its GID.
+
+	3. We know which tiles each gaussian touches from tile_min and tile_max. We then can "duplicate" gaussians
+	by creating total_duplicates keys like (tile_idx | depth). Keys should be like:
+	[tile32_depth10.1, tile33_depth10.1, ...]
+	When writing to keys, we can use offsets[GID] to know which index to start writing to. We'll use depth[GID]
+	to know the depth, obviously. We also will store GID in the values list to map keys to gaussians.
+
+	4. Sort those lists by sorting keys first on tile ID, then on depth. We now have tiled_gaussian_ids_sorted.
+
+	5. 
+
+	Why tile at all and not just do it per pixel? We're already going to be making TONS of global memory calls.
+	By tiling, we can take advantage of SMEM to ideally make this operation less memory intensie. Sure, some 
+	pixels will ignore some gaussians. But at least we have far fewer unique DRAM calls and DRAM requirements.
+	*/
+	int* offsets_ptr;
+	cudaMalloc(&offsets_ptr, num_gaussians * sizeof(int));
+
+	thrust::device_ptr<int> tiles_touched_thrust(tiles_touched_ptr);
+	thrust::device_ptr<int> offsets_thrust(offsets_ptr);
+	// This is prefix sum despite the fancy name
+	thrust::exclusive_scan(tiles_touched_thrust,
+						   tiles_touched_thrust + num_gaussians,
+						   offsets_thrust);
+
+	// We avoid unnecessary transfers by bringing back ONLY the last element of each
+	int last_offset;
+	int last_tiles_touched;
+	cudaMemcpy(&last_offset, offsets_ptr + num_gaussians - 1, sizeof(int),
+			   cudaMemcpyDeviceToHost);
+	cudaMemcpy(&last_tiles_touched, tiles_touched_ptr + num_gaussians - 1, sizeof(int),
+			   cudaMemcpyDeviceToHost);
+	int total_duplicates = last_offset + last_tiles_touched;
+
+	uint64_t* tiled_gaussian_keys;
+	int* tiled_gaussian_values;
+
+	cudaMalloc(&tiled_gaussian_keys, total_duplicates * sizeof(uint64_t));
+	cudaMalloc(&tiled_gaussian_values, total_duplicates * sizeof(int));
+
+	duplicate_gaussians<<<blocks, threads>>>(
+		num_gaussians,
+		offsets_ptr,
+		tile_min_ptr,
+		tile_max_ptr,
+		depths_ptr,
+		num_tiles_x,
+		tiled_gaussian_keys,
+		tiled_gaussian_values
+	);
+	check_cuda_error("duplicate_gaussians");
+
+	uint64_t* tiled_gaussian_keys_sorted;
+	int* tiled_gaussian_values_sorted;
+	cudaMalloc(&tiled_gaussian_keys_sorted, total_duplicates * sizeof(uint64_t));
+	cudaMalloc(&tiled_gaussian_values_sorted, total_duplicates * sizeof(int));
+
+	void* d_temp_storage = nullptr;
+	size_t temp_storage_bytes = 0;
+
+	// Radix sort needs temporary storage. We don't know exactly how much, but if you pass it 
+	// a nullptr it will automatically decide how much it needs.
+	cub::DeviceRadixSort::SortPairs(
+		d_temp_storage, temp_storage_bytes,
+		tiled_gaussian_keys, tiled_gaussian_keys_sorted,
+		tiled_gaussian_values, tiled_gaussian_values_sorted,
+		total_duplicates
 	);
 
+	cudaMalloc(&d_temp_storage, temp_storage_bytes);
+
+	cub::DeviceRadixSort::SortPairs(
+		d_temp_storage, temp_storage_bytes,
+		tiled_gaussian_keys, tiled_gaussian_keys_sorted,
+		tiled_gaussian_values, tiled_gaussian_values_sorted,
+		total_duplicates
+	);
+
+	cudaFree(d_temp_storage);
+	check_cuda_error("radix_sort");
+
+	uint2* tile_ranges;
+	cudaMalloc(&tile_ranges, num_tiles_x * num_tiles_y * sizeof(uint2));
+	cudaMemset(tile_ranges, 0, num_tiles_x * num_tiles_y * sizeof(uint2));
+
+	int blocks_ranges = (total_duplicates + threads - 1) / threads;
+	identify_tile_ranges<<<blocks_ranges, threads>>>(
+		total_duplicates,
+		tiled_gaussian_keys_sorted,
+		tile_ranges
+	);
+	check_cuda_error("identify_tile_ranges");
+
+	// Step 3: alpha blend/render the gaussians
+	float* output_ptr = output.data_ptr<float>();
+
+	dim3 block(TILE_SIZE, TILE_SIZE);
+	dim3 grid(num_tiles_x, num_tiles_y);
+
 	render_gaussians<<<grid, block>>>(
-		num_gaussians,
-		indices_ptr,
+		tile_ranges,
+		tiled_gaussian_values_sorted,
 		means2D_ptr,
 		cov2D_ptr,
 		colors_ptr,
@@ -227,6 +447,20 @@ torch::Tensor rasterize(
 		output_ptr
 	);
 	check_cuda_error("render_gaussians");
+
+	// Free GPU memory for intermediate results
+	cudaFree(means2D_ptr);
+	cudaFree(cov2D_ptr);
+	cudaFree(depths_ptr);
+	cudaFree(tile_min_ptr);
+	cudaFree(tile_max_ptr);
+	cudaFree(tiles_touched_ptr);
+	cudaFree(offsets_ptr);
+	cudaFree(tiled_gaussian_keys);
+	cudaFree(tiled_gaussian_values);
+	cudaFree(tiled_gaussian_keys_sorted);
+	cudaFree(tiled_gaussian_values_sorted);
+	cudaFree(tile_ranges);
 
 	return output;
 }
