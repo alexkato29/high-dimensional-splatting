@@ -16,7 +16,7 @@ def _get_rasterizer() -> Any:
 	current_dir: Path = Path(__file__).parent
 
 	sources: list[str] = [
-		str(current_dir / "rasterizer.cu"),
+		str(current_dir / "forward.cu"),
 		str(current_dir / "bindings.cpp")
 	]
 

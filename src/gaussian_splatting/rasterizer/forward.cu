@@ -343,9 +343,10 @@ torch::Tensor rasterize(
 	When writing to keys, we can use offsets[GID] to know which index to start writing to. We'll use depth[GID]
 	to know the depth, obviously. We also will store GID in the values list to map keys to gaussians.
 
-	4. Sort those lists by sorting keys first on tile ID, then on depth. We now have tiled_gaussian_ids_sorted.
+	4. Sort those lists by sorting keys first on tile ID, then on depth. We now have tiled_gaussian_keys_sorted
+	and tiled_gaussian_values_sorted.
 
-	5. 
+	5. Traverse the tiled_gaussian_keys_sorted and extract the tile IDs to build tiled_ranges.
 
 	Why tile at all and not just do it per pixel? We're already going to be making TONS of global memory calls.
 	By tiling, we can take advantage of SMEM to ideally make this operation less memory intensie. Sure, some 
