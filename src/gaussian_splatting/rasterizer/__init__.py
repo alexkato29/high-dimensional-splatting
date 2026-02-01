@@ -38,6 +38,47 @@ def _get_rasterizer() -> Any:
 	return _rasterizer_module
 
 
+class RasterizeGaussians(torch.autograd.Function):
+	@staticmethod
+	def forward(
+		ctx,
+		means3D: torch.Tensor,
+		scales: torch.Tensor,
+		quaternions: torch.Tensor,
+		opacities: torch.Tensor,
+		colors: torch.Tensor,
+		world_to_cam_matrix: torch.Tensor,
+		focal_x: float,
+		focal_y: float,
+		c_x: float,
+		c_y: float,
+		image_width: int,
+		image_height: int
+	) -> torch.Tensor:
+		_C = _get_rasterizer()
+
+		output = _C.rasterize(
+			means3D.contiguous(),
+			scales.contiguous(),
+			quaternions.contiguous(),
+			opacities.contiguous(),
+			colors.contiguous(),
+			world_to_cam_matrix.contiguous(),
+			float(focal_x),
+			float(focal_y),
+			float(c_x),
+			float(c_y),
+			int(image_width),
+			int(image_height)
+		)
+
+		return output
+
+	@staticmethod
+	def backward(ctx, grad_output):
+		return None, None, None, None, None, None, None, None, None, None, None, None
+
+
 def rasterize(
 	means3D: torch.Tensor,
 	scales: torch.Tensor,
@@ -80,19 +121,17 @@ def rasterize(
 	assert colors.shape == means3D.shape
 	assert world_to_cam_matrix.shape == (4, 4)
 
-	_C = _get_rasterizer()
-
-	return _C.rasterize(
-		means3D.contiguous(),
-		scales.contiguous(),
-		quaternions.contiguous(),
-		opacities.contiguous(),
-		colors.contiguous(),
-		world_to_cam_matrix.contiguous(),
-		float(focal_x),
-		float(focal_y),
-		float(c_x),
-		float(c_y),
-		int(image_width),
-		int(image_height)
+	return RasterizeGaussians.apply(
+		means3D,
+		scales,
+		quaternions,
+		opacities,
+		colors,
+		world_to_cam_matrix,
+		focal_x,
+		focal_y,
+		c_x,
+		c_y,
+		image_width,
+		image_height
 	)
