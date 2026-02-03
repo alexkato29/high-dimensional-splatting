@@ -2,7 +2,7 @@
 data/
 .DS_Store
 notes.md
-tests/
+tests/unit/
 pytest.ini
 
 # Byte-compiled / optimized / DLL files
