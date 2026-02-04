@@ -31,7 +31,6 @@ inline void check_cuda_error(const char* kernel_name) {
 	}
 }
 
-
 __global__ void project_gaussians(
 	int num_gaussians,
 	const float* means3D,
@@ -118,10 +117,50 @@ __global__ void project_gaussians(
 	tiles_touched[idx] = (tile_max_coords.x - tile_min_coords.x + 1) * (tile_max_coords.y - tile_min_coords.y + 1);
 }
 
+__global__ void build_coarse_index(
+	const int* offsets,
+	int* coarse_offsets,
+	int coarse_buckets,
+	int stride,
+	int num_gaussians
+) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= coarse_buckets) return;
 
-__device__ int find_gaussian_binary_search(const int* offsets, int num_gaussians, int output_idx) {
-	int left = 0;
-	int right = num_gaussians - 1;
+	int src_idx = min(idx * stride, num_gaussians - 1);
+	coarse_offsets[idx] = offsets[src_idx];
+}
+
+__device__ int find_gaussian_binary_search(
+	const int* offsets,
+	int num_gaussians,
+	int output_idx,
+	const int* coarse_offsets,
+	int coarse_buckets,
+	int coarse_stride
+) {
+	/*
+	To optimize L1 & L2 cache utilization, we split the binary search into two parts.
+	The first N iterations of the binary search always check the same 2^(N-1) elements
+	of the array. Ideally, those will all be in the L1 cache. To attempt to coerce the
+	hardware into doing this, we put those elements all in a single array that it can
+	easily keep in the cache rather than relying on keep the cache lines from the large
+	array all in the L1 cache (most elements are wasteful in that configuration.
+	*/
+	int coarse_left = 0;
+	int coarse_right = coarse_buckets - 1;
+
+	while (coarse_left < coarse_right) {
+		int mid = (coarse_left + coarse_right + 1) / 2;
+		if (coarse_offsets[mid] <= output_idx) {
+			coarse_left = mid;
+		} else {
+			coarse_right = mid - 1;
+		}
+	}
+
+	int left = min(coarse_left * coarse_stride, num_gaussians - 1);
+	int right = min((coarse_left + 1) * coarse_stride - 1, num_gaussians - 1);
 
 	while (left < right) {
 		int mid = (left + right + 1) / 2;
@@ -134,30 +173,13 @@ __device__ int find_gaussian_binary_search(const int* offsets, int num_gaussians
 	return left;
 }
 
-
-__global__ void precompute_gaussian_indices(
-	int num_gaussians,
-	const int* offsets,
-	const int* tiles_touched,
-	int* gaussian_indices
-) {
-	int gaussian_idx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (gaussian_idx >= num_gaussians) return;
-
-	int start = offsets[gaussian_idx];
-	int count = tiles_touched[gaussian_idx];
-
-	for (int i = 0; i < count; i++) {
-		gaussian_indices[start + i] = gaussian_idx;
-	}
-}
-
-
 __global__ void duplicate_gaussians(
 	int num_duplicates,
 	int num_gaussians,
-	//const int* gaussian_indices,
 	const int* offsets,
+	const int* coarse_offsets,
+	int coarse_buckets,
+	int coarse_stride,
 	const float4* gaussian_data,
 	int tile_size,
 	int num_tiles_x,
@@ -167,16 +189,35 @@ __global__ void duplicate_gaussians(
 	int* tiled_gaussian_values
 ) {
 	/*
-	This kernel initially worked by having one thread per gaussian. The trouble is that output
-	writes are shuffled and highly unpredictable. Some gaussians are duplicated many times,
-	some not at all, leading to huge warp divergence. We now map each thread to an output to
-	avoid the cost of the shuffling/divergence.
+	This kernel initially had "flipped" parallelism and mapped threads to gaussian ids
+	rather than to output indices. That ate away at performance due to massive problems
+	with shuffled writes to global memory. Instead, mapping threads to output indices 
+	ended up running substantially faster (~x2).
+
+	I also tried CSR. Basically, swap binary searches for writes to SMEM:
+	1. Find the min and max gaussian ID that the block works on
+	2. Make an array in smem of length blockDim.x (but must be known at compile time)
+	3. For every GID this block touches, replicate the GID in smem on all the indices
+	of output it is tied to
+	4. Lookup the output_idx in gaussian_indices[output_idx] rather than making a binary
+	search call
+
+	However, this approach was ultimately slower since the writes to smem ended up leading
+	to warp divergence. Also, gaussians have space in between them in the output (obviously,
+	that is what this kernel solves), so the smem writes weren't coalesced. Plus, caching is 
+	so effective that the binary search baseline is already hard to beat.
 	*/
 	int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (output_idx >= num_duplicates) return;
 
-	int gaussian_idx = find_gaussian_binary_search(offsets, num_gaussians, output_idx);
-	// int gaussian_idx = gaussian_indices[output_idx];
+	int gaussian_idx = find_gaussian_binary_search(
+		offsets,
+		num_gaussians,
+		output_idx,
+		coarse_offsets,
+		coarse_buckets,
+		coarse_stride
+	);
 
 	float4 data = gaussian_data[gaussian_idx];
 	float2 uv = make_float2(data.x, data.y);
@@ -319,8 +360,8 @@ torch::Tensor rasterize(
 	float* world_to_cam_matrix_ptr = world_to_cam_matrix.data_ptr<float>();
 
 	// We just need the output to be a torch tensor, but the rest can be regular dtypes
-	float4* gaussian_data_ptr;  // packed: xy=means2D, z=radius, w=depth (for duplicate_gaussians)
-	float2* means2D_ptr;  // separate for render_gaussians
+	float4* gaussian_data_ptr;  // Packed for duplication: xy=means2D, z=radius, w=depth
+	float2* means2D_ptr;  // Separate for render_gaussians
 	float* cov2D_ptr;
 	int* tiles_touched_ptr;
 
@@ -421,17 +462,20 @@ torch::Tensor rasterize(
 			   cudaMemcpyDeviceToHost);
 	int total_duplicates = last_offset + last_tiles_touched;
 
-	/*
-	int* gaussian_indices_ptr = nullptr;
-	cudaMalloc(&gaussian_indices_ptr, total_duplicates * sizeof(int));
-	precompute_gaussian_indices<<<blocks, threads>>>(
-		num_gaussians,
+	const int COARSE_BUCKETS = 4096;
+	int coarse_stride = (num_gaussians + COARSE_BUCKETS - 1) / COARSE_BUCKETS;
+	int* coarse_offsets_ptr;
+	cudaMalloc(&coarse_offsets_ptr, COARSE_BUCKETS * sizeof(int));
+
+	int coarse_blocks = (COARSE_BUCKETS + threads - 1) / threads;
+	build_coarse_index<<<coarse_blocks, threads>>>(
 		offsets_ptr,
-		tiles_touched_ptr,
-		gaussian_indices_ptr
+		coarse_offsets_ptr,
+		COARSE_BUCKETS,
+		coarse_stride,
+		num_gaussians
 	);
-	check_cuda_error("precompute_gaussian_indices");
-	*/
+	check_cuda_error("build_coarse_index");
 
 	uint64_t* tiled_gaussian_keys;
 	int* tiled_gaussian_values;
@@ -439,12 +483,15 @@ torch::Tensor rasterize(
 	cudaMalloc(&tiled_gaussian_keys, total_duplicates * sizeof(uint64_t));
 	cudaMalloc(&tiled_gaussian_values, total_duplicates * sizeof(int));
 
+	// Optimization of this kernel was super fun, see the kernel for info
 	int blocks_reverse = (total_duplicates + threads - 1) / threads;
 	duplicate_gaussians<<<blocks_reverse, threads>>>(
 		total_duplicates,
 		num_gaussians,
-		//gaussian_indices_ptr,
 		offsets_ptr,
+		coarse_offsets_ptr,
+		COARSE_BUCKETS,
+		coarse_stride,
 		gaussian_data_ptr,
 		TILE_SIZE,
 		num_tiles_x,
@@ -520,7 +567,7 @@ torch::Tensor rasterize(
 	cudaFree(cov2D_ptr);
 	cudaFree(tiles_touched_ptr);
 	cudaFree(offsets_ptr);
-	// cudaFree(gaussian_indices_ptr);
+	cudaFree(coarse_offsets_ptr);
 	cudaFree(tiled_gaussian_keys);
 	cudaFree(tiled_gaussian_values);
 	cudaFree(tiled_gaussian_keys_sorted);
