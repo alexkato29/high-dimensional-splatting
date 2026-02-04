@@ -8,6 +8,10 @@
 #include <cub/device/device_radix_sort.cuh>
 #include "helpers.h"
 
+
+// TODO: Once backward pass working, we can consider optimizing memory further via lower
+// precision storage of gaussian data (e.g., uint4) to allow even higher vectorization during reads
+
 inline void check_cuda_error(const char* kernel_name) {
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) {
@@ -43,11 +47,9 @@ __global__ void project_gaussians(
 	int tile_size,
 	int num_tiles_x,
 	int num_tiles_y,
-	float* means2D,
+	float4* gaussian_data,
+	float2* means2D,
 	float* cov2D,
-	float* depths,
-	int2* tile_min,
-	int2* tile_max,
 	int* tiles_touched
 ) {
 	// Step 1: We must project the gaussian mean to the screen space (u, v)
@@ -60,9 +62,8 @@ __global__ void project_gaussians(
 	// We cull along the way to avoid any and all unnecessary work
 	// This causes warp divergence, so we will have to see if it impacts perf
 	if (is_behind_camera(p_cam.z, 0.2f)) {
-		depths[idx] = 1e10f;
-		tile_min[idx] = make_int2(0, 0);
-		tile_max[idx] = make_int2(0, 0);
+		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
+		means2D[idx] = make_float2(0.0f, 0.0f);
 		tiles_touched[idx] = 0;
 		return;
 	}
@@ -70,15 +71,11 @@ __global__ void project_gaussians(
 	float2 uv = pinhole_projection(p_cam, focal_x, focal_y, c_x, c_y);
 
 	if (is_off_screen(uv, image_width, image_height)) {
-		depths[idx] = 1e10f;
-		tile_min[idx] = make_int2(0, 0);
-		tile_max[idx] = make_int2(0, 0);
+		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
+		means2D[idx] = make_float2(0.0f, 0.0f);
 		tiles_touched[idx] = 0;
 		return;
 	}
-
-	((float2*)means2D)[idx] = uv;
-	depths[idx] = p_cam.z;
 
 	// Step 2: We project the 3D covariance matrix to 2D
 	float3 scale = load_float3(scales, idx);
@@ -102,6 +99,11 @@ __global__ void project_gaussians(
 
 	float radius = compute_radius_from_cov2D(cov2D_out);
 
+	// Seems repetitive, but we do this because duplicate_gaussians is extremely memory bound and
+	// benefits from one vectorized representation, while render_gaussians only needs means.
+	gaussian_data[idx] = make_float4(uv.x, uv.y, radius, p_cam.z);
+	means2D[idx] = uv;
+
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
 
@@ -113,42 +115,96 @@ __global__ void project_gaussians(
 	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
 	tile_max_coords.y = min(num_tiles_y - 1, tile_max_coords.y);
 
-	tile_min[idx] = tile_min_coords;
-	tile_max[idx] = tile_max_coords;
-
 	tiles_touched[idx] = (tile_max_coords.x - tile_min_coords.x + 1) * (tile_max_coords.y - tile_min_coords.y + 1);
 }
 
 
-__global__ void duplicate_gaussians(
+__device__ int find_gaussian_binary_search(const int* offsets, int num_gaussians, int output_idx) {
+	int left = 0;
+	int right = num_gaussians - 1;
+
+	while (left < right) {
+		int mid = (left + right + 1) / 2;
+		if (offsets[mid] <= output_idx) {
+			left = mid;
+		} else {
+			right = mid - 1;
+		}
+	}
+	return left;
+}
+
+
+__global__ void precompute_gaussian_indices(
 	int num_gaussians,
 	const int* offsets,
-	const int2* tile_min,
-	const int2* tile_max,
-	const float* depths,
+	const int* tiles_touched,
+	int* gaussian_indices
+) {
+	int gaussian_idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (gaussian_idx >= num_gaussians) return;
+
+	int start = offsets[gaussian_idx];
+	int count = tiles_touched[gaussian_idx];
+
+	for (int i = 0; i < count; i++) {
+		gaussian_indices[start + i] = gaussian_idx;
+	}
+}
+
+
+__global__ void duplicate_gaussians(
+	int num_duplicates,
+	int num_gaussians,
+	//const int* gaussian_indices,
+	const int* offsets,
+	const float4* gaussian_data,
+	int tile_size,
+	int num_tiles_x,
+	int num_tiles_y,
 	int tile_cols,
 	uint64_t* tiled_gaussian_keys,
 	int* tiled_gaussian_values
 ) {
-	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (idx >= num_gaussians) return;
+	/*
+	This kernel initially worked by having one thread per gaussian. The trouble is that output
+	writes are shuffled and highly unpredictable. Some gaussians are duplicated many times,
+	some not at all, leading to huge warp divergence. We now map each thread to an output to
+	avoid the cost of the shuffling/divergence.
+	*/
+	int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (output_idx >= num_duplicates) return;
 
-	int offset = offsets[idx];
-	int2 tile_min_coords = tile_min[idx];
-	int2 tile_max_coords = tile_max[idx];
-	float depth = depths[idx];
+	int gaussian_idx = find_gaussian_binary_search(offsets, num_gaussians, output_idx);
+	// int gaussian_idx = gaussian_indices[output_idx];
+
+	float4 data = gaussian_data[gaussian_idx];
+	float2 uv = make_float2(data.x, data.y);
+	float radius = data.z;
+	float depth = data.w;
 	uint32_t depth_bits = *((uint32_t*)&depth);
 
-	int count = 0;
-	for (int y = tile_min_coords.y; y <= tile_max_coords.y; y++) {
-		for (int x = tile_min_coords.x; x <= tile_max_coords.x; x++) {
-			int tile_idx = y * tile_cols + x;
-			uint64_t key = ((uint64_t)tile_idx << 32) | depth_bits;
-			tiled_gaussian_keys[offset + count] = key;
-			tiled_gaussian_values[offset + count] = idx;
-			count++;
-		}
-	}
+	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
+	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
+
+	int2 tile_min_coords = pixel_to_tile(min_pixel, tile_size);
+	int2 tile_max_coords = pixel_to_tile(max_pixel, tile_size);
+
+	tile_min_coords.x = max(0, tile_min_coords.x);
+	tile_min_coords.y = max(0, tile_min_coords.y);
+	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
+	tile_max_coords.y = min(num_tiles_y - 1, tile_max_coords.y);
+
+	int local_idx = output_idx - offsets[gaussian_idx];
+	int tiles_per_row = tile_max_coords.x - tile_min_coords.x + 1;
+	int tile_y = tile_min_coords.y + local_idx / tiles_per_row;
+	int tile_x = tile_min_coords.x + local_idx % tiles_per_row;
+
+	int tile_idx = tile_y * tile_cols + tile_x;
+	uint64_t key = ((uint64_t)tile_idx << 32) | depth_bits;
+
+	tiled_gaussian_keys[output_idx] = key;
+	tiled_gaussian_values[output_idx] = gaussian_idx;
 }
 
 __global__ void identify_tile_ranges(
@@ -263,18 +319,14 @@ torch::Tensor rasterize(
 	float* world_to_cam_matrix_ptr = world_to_cam_matrix.data_ptr<float>();
 
 	// We just need the output to be a torch tensor, but the rest can be regular dtypes
-	float* means2D_ptr;
+	float4* gaussian_data_ptr;  // packed: xy=means2D, z=radius, w=depth (for duplicate_gaussians)
+	float2* means2D_ptr;  // separate for render_gaussians
 	float* cov2D_ptr;
-	float* depths_ptr;
-	int2* tile_min_ptr;
-	int2* tile_max_ptr;
 	int* tiles_touched_ptr;
 
-	cudaMalloc(&means2D_ptr, num_gaussians * 2 * sizeof(float));
+	cudaMalloc(&gaussian_data_ptr, num_gaussians * sizeof(float4));
+	cudaMalloc(&means2D_ptr, num_gaussians * sizeof(float2));
 	cudaMalloc(&cov2D_ptr, num_gaussians * 3 * sizeof(float));
-	cudaMalloc(&depths_ptr, num_gaussians * sizeof(float));
-	cudaMalloc(&tile_min_ptr, num_gaussians * sizeof(int2));
-	cudaMalloc(&tile_max_ptr, num_gaussians * sizeof(int2));
 	cudaMalloc(&tiles_touched_ptr, num_gaussians * sizeof(int));
 
 	// Step 1: Project gaussians from 3D world space to 2D screen space
@@ -295,11 +347,9 @@ torch::Tensor rasterize(
 		TILE_SIZE,
 		num_tiles_x,
 		num_tiles_y,
+		gaussian_data_ptr,
 		means2D_ptr,
 		cov2D_ptr,
-		depths_ptr,
-		tile_min_ptr,
-		tile_max_ptr,
 		tiles_touched_ptr
 	);
 	check_cuda_error("project_gaussians");
@@ -371,18 +421,34 @@ torch::Tensor rasterize(
 			   cudaMemcpyDeviceToHost);
 	int total_duplicates = last_offset + last_tiles_touched;
 
+	/*
+	int* gaussian_indices_ptr = nullptr;
+	cudaMalloc(&gaussian_indices_ptr, total_duplicates * sizeof(int));
+	precompute_gaussian_indices<<<blocks, threads>>>(
+		num_gaussians,
+		offsets_ptr,
+		tiles_touched_ptr,
+		gaussian_indices_ptr
+	);
+	check_cuda_error("precompute_gaussian_indices");
+	*/
+
 	uint64_t* tiled_gaussian_keys;
 	int* tiled_gaussian_values;
 
 	cudaMalloc(&tiled_gaussian_keys, total_duplicates * sizeof(uint64_t));
 	cudaMalloc(&tiled_gaussian_values, total_duplicates * sizeof(int));
 
-	duplicate_gaussians<<<blocks, threads>>>(
+	int blocks_reverse = (total_duplicates + threads - 1) / threads;
+	duplicate_gaussians<<<blocks_reverse, threads>>>(
+		total_duplicates,
 		num_gaussians,
+		//gaussian_indices_ptr,
 		offsets_ptr,
-		tile_min_ptr,
-		tile_max_ptr,
-		depths_ptr,
+		gaussian_data_ptr,
+		TILE_SIZE,
+		num_tiles_x,
+		num_tiles_y,
 		num_tiles_x,
 		tiled_gaussian_keys,
 		tiled_gaussian_values
@@ -439,7 +505,7 @@ torch::Tensor rasterize(
 	render_gaussians<<<grid, block>>>(
 		tile_ranges,
 		tiled_gaussian_values_sorted,
-		means2D_ptr,
+		(float*)means2D_ptr,
 		cov2D_ptr,
 		colors_ptr,
 		opacities_ptr,
@@ -449,14 +515,12 @@ torch::Tensor rasterize(
 	);
 	check_cuda_error("render_gaussians");
 
-	// Free GPU memory for intermediate results
+	cudaFree(gaussian_data_ptr);
 	cudaFree(means2D_ptr);
 	cudaFree(cov2D_ptr);
-	cudaFree(depths_ptr);
-	cudaFree(tile_min_ptr);
-	cudaFree(tile_max_ptr);
 	cudaFree(tiles_touched_ptr);
 	cudaFree(offsets_ptr);
+	// cudaFree(gaussian_indices_ptr);
 	cudaFree(tiled_gaussian_keys);
 	cudaFree(tiled_gaussian_values);
 	cudaFree(tiled_gaussian_keys_sorted);
