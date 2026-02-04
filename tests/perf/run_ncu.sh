@@ -1,3 +1,4 @@
+#!/bin/bash
 set -e
 
 SCENARIO=${1:-medium}

@@ -15,7 +15,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "num_gaussians": 10_000,
         "image_width": 640,
         "image_height": 480,
-        "warmup_iters": 5,
+        "warmup_iters": 2,
         "profile_iters": 1,
         "description": "Quick test for development"
     },
@@ -23,7 +23,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "num_gaussians": 100_000,
         "image_width": 1920,
         "image_height": 1080,
-        "warmup_iters": 10,
+        "warmup_iters": 2,
         "profile_iters": 1,
         "description": "Realistic workload (1080p, 100k gaussians)"
     },
@@ -31,7 +31,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "num_gaussians": 500_000,
         "image_width": 1920,
         "image_height": 1080,
-        "warmup_iters": 10,
+        "warmup_iters": 2,
         "profile_iters": 1,
         "description": "Large scene (1080p, 500k gaussians)"
     },
@@ -39,7 +39,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "num_gaussians": 1_000_000,
         "image_width": 3840,
         "image_height": 2160,
-        "warmup_iters": 5,
+        "warmup_iters": 2,
         "profile_iters": 1,
         "description": "Stress test (4K, 1M gaussians)"
     },
@@ -99,7 +99,7 @@ def profile_rasterizer(scenario_name: str = 'medium', verbose: bool = True) -> t
     if verbose:
         print(f"Warming up ({scenario['warmup_iters']} iterations)...")
 
-    output: torch.Tensor = torch.empty()
+    output: torch.Tensor = torch.empty((scenario['image_height'], scenario['image_width'], 3))
     for _ in range(scenario['warmup_iters']):
         output = rasterize(**data)
 
