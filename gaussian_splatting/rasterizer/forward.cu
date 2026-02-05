@@ -282,8 +282,7 @@ __global__ void render_gaussians(
 
 		if (alpha < 1e-4f) continue;
 
-		// Hardcoded mint green until we do SH
-		float3 color = make_float3(62.0f, 180.0f, 137.0f);
+		float3 color = ((float3*) colors)[idx];
 
 		accumulated_color.x += alpha * transmittance * color.x;
 		accumulated_color.y += alpha * transmittance * color.y;
