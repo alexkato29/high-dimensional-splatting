@@ -48,7 +48,7 @@ __global__ void project_gaussians(
 	int num_tiles_y,
 	float4* gaussian_data,
 	float2* means2D,
-	float* cov2D,
+	float4* cov2D,
 	int* tiles_touched
 ) {
 	// Step 1: We must project the gaussian mean to the screen space (u, v)
@@ -69,7 +69,7 @@ __global__ void project_gaussians(
 
 	float2 uv = pinhole_projection(p_cam, focal_x, focal_y, c_x, c_y);
 
-	if (is_off_screen(uv, image_width, image_height)) {
+	if (is_centered_off_screen(uv, image_width, image_height)) {
 		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
 		means2D[idx] = make_float2(0.0f, 0.0f);
 		tiles_touched[idx] = 0;
@@ -94,9 +94,16 @@ __global__ void project_gaussians(
 		focal_y
 	);
 
-	((float3*)cov2D)[idx] = cov2D_out;
+	cov2D[idx] = make_float4(cov2D_out.x, cov2D_out.y, cov2D_out.z, 0.0f);
 
 	float radius = compute_radius_from_cov2D(cov2D_out);
+
+	if (is_completely_off_screen(uv, image_width, image_height, radius)) {
+		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
+		means2D[idx] = make_float2(0.0f, 0.0f);
+		tiles_touched[idx] = 0;
+		return;
+	}
 
 	// Seems repetitive, but we do this because duplicate_gaussians is extremely memory bound and
 	// benefits from one vectorized representation, while render_gaussians only needs means.
@@ -109,6 +116,8 @@ __global__ void project_gaussians(
 	int2 tile_min_coords = pixel_to_tile(min_pixel, tile_size);
 	int2 tile_max_coords = pixel_to_tile(max_pixel, tile_size);
 
+	// This should handle partially on screen gaussians. We just clamp it to only on screen tiles,
+	// then we just need to make sure we do the same when duplicating the gaussians.
 	tile_min_coords.x = max(0, tile_min_coords.x);
 	tile_min_coords.y = max(0, tile_min_coords.y);
 	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
@@ -189,18 +198,18 @@ __global__ void duplicate_gaussians(
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
 
-	int2 tile_min_coords = pixel_to_tile(min_pixel, tile_size);
-	int2 tile_max_coords = pixel_to_tile(max_pixel, tile_size);
+	int2 gaussian_min_tile_coords = pixel_to_tile(min_pixel, tile_size);
+	int2 gaussian_max_tile_coords = pixel_to_tile(max_pixel, tile_size);
 
-	tile_min_coords.x = max(0, tile_min_coords.x);
-	tile_min_coords.y = max(0, tile_min_coords.y);
-	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
-	tile_max_coords.y = min(num_tiles_y - 1, tile_max_coords.y);
+	gaussian_min_tile_coords.x = max(0, gaussian_min_tile_coords.x);
+	gaussian_min_tile_coords.y = max(0, gaussian_min_tile_coords.y);
+	gaussian_max_tile_coords.x = min(num_tiles_x - 1, gaussian_max_tile_coords.x);
+	gaussian_max_tile_coords.y = min(num_tiles_y - 1, gaussian_max_tile_coords.y);
 
 	int local_idx = output_idx - offsets[gaussian_idx];
-	int tiles_per_row = tile_max_coords.x - tile_min_coords.x + 1;
-	int tile_y = tile_min_coords.y + local_idx / tiles_per_row;
-	int tile_x = tile_min_coords.x + local_idx % tiles_per_row;
+	int gaussian_width = gaussian_max_tile_coords.x - gaussian_min_tile_coords.x + 1;
+	int tile_y = gaussian_min_tile_coords.y + local_idx / gaussian_width;
+	int tile_x = gaussian_min_tile_coords.x + local_idx % gaussian_width;
 
 	int tile_idx = tile_y * tile_cols + tile_x;
 	uint64_t key = ((uint64_t)tile_idx << 32) | depth_bits;
@@ -239,7 +248,7 @@ __global__ void render_gaussians(
 	const uint2* tile_ranges,
 	const int* tiled_gaussian_values_sorted,
 	const float* means2D,
-	const float* cov2D,
+	const float4* cov2D,
 	const float* colors,
 	const float* opacities,
 	int image_width,
@@ -254,7 +263,7 @@ __global__ void render_gaussians(
 
 	float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 
-	float3 accumulated_color = make_float3(0.0f, 0.0f, 0.0f);
+	float4 accumulated_color = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 	float transmittance = 1.0f;
 
 	uint2 range = tile_ranges[tile_idx];
@@ -265,14 +274,15 @@ __global__ void render_gaussians(
 		int idx = tiled_gaussian_values_sorted[i];
 
 		float2 mean = ((float2*)means2D)[idx];
-		float3 cov = ((float3*)cov2D)[idx];
-		float3 color = ((float3*)colors)[idx];
-		float opacity = opacities[idx];
-
+		float4 cov = cov2D[idx];
 		float weight = evaluate_gaussian_2d(pixel, mean, cov);
+
+		float opacity = opacities[idx];
 		float alpha = opacity * weight;
 
 		if (alpha < 1e-4f) continue;
+
+		float3 color = ((float3*)colors)[idx];
 
 		accumulated_color.x += alpha * transmittance * color.x;
 		accumulated_color.y += alpha * transmittance * color.y;
@@ -284,9 +294,7 @@ __global__ void render_gaussians(
 	}
 
 	int pixel_idx = py * image_width + px;
-	output[pixel_idx * 3 + 0] = accumulated_color.x;
-	output[pixel_idx * 3 + 1] = accumulated_color.y;
-	output[pixel_idx * 3 + 2] = accumulated_color.z;
+	((float4*)output)[pixel_idx] = accumulated_color;
 }
 
 torch::Tensor rasterize(
@@ -305,9 +313,6 @@ torch::Tensor rasterize(
 ) {
 	const int TILE_SIZE = 16;
 
-	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-	torch::Tensor output = torch::zeros({image_height, image_width, 3}, options);
-
 	int num_gaussians = means3D.size(0);
 	int num_tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 	int num_tiles_y = (image_height + TILE_SIZE - 1) / TILE_SIZE;
@@ -323,12 +328,12 @@ torch::Tensor rasterize(
 	// We just need the output to be a torch tensor, but the rest can be regular dtypes
 	float4* gaussian_data_ptr;  // Packed for duplication: xy=means2D, z=radius, w=depth
 	float2* means2D_ptr;  // Separate for render_gaussians
-	float* cov2D_ptr;
+	float4* cov2D_ptr;
 	int* tiles_touched_ptr;
 
 	cudaMalloc(&gaussian_data_ptr, num_gaussians * sizeof(float4));
 	cudaMalloc(&means2D_ptr, num_gaussians * sizeof(float2));
-	cudaMalloc(&cov2D_ptr, num_gaussians * 3 * sizeof(float));
+	cudaMalloc(&cov2D_ptr, num_gaussians * sizeof(float4));
 	cudaMalloc(&tiles_touched_ptr, num_gaussians * sizeof(int));
 
 	// Step 1: Project gaussians from 3D world space to 2D screen space
@@ -487,6 +492,10 @@ torch::Tensor rasterize(
 	check_cuda_error("identify_tile_ranges");
 
 	// Step 3: alpha blend/render the gaussians
+	// We use a 4th channel to allow vectorized writes, but we don't actually care about it
+	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+	torch::Tensor output = torch::zeros({image_height, image_width, 4}, options);
+
 	float* output_ptr = output.data_ptr<float>();
 
 	dim3 block(TILE_SIZE, TILE_SIZE);
@@ -516,5 +525,6 @@ torch::Tensor rasterize(
 	cudaFree(tiled_gaussian_values_sorted);
 	cudaFree(tile_ranges);
 
-	return output;
+	// Drop the useless 4th channel here, torch can do this for free functionally
+	return output.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
 }

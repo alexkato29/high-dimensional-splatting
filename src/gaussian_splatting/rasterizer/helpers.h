@@ -28,12 +28,21 @@ __device__ inline float2 pinhole_projection(float3 p_cam, float focal_x, float f
 	return make_float2(u, v);
 }
 
-__device__ inline bool is_off_screen(float2 p, int width, int height, int margin = 100) {
+__device__ inline bool is_centered_off_screen(float2 p, int width, int height, int margin = 100) {
 	return (p.x < -margin || p.x >= width + margin ||
 			p.y < -margin || p.y >= height + margin);
 }
 
-__device__ inline float evaluate_gaussian_2d(float2 pixel, float2 mean, float3 cov) {
+__device__ inline bool is_completely_off_screen(float2 p, int width, int height, float radius) {
+	return (
+		p.x - radius > width || 
+		p.x + radius < 0 ||
+		p.y - radius > height ||
+		p.y + radius < 0
+	);
+}
+
+__device__ inline float evaluate_gaussian_2d(float2 pixel, float2 mean, float4 cov) {
 	float dx = pixel.x - mean.x;
 	float dy = pixel.y - mean.y;
 
