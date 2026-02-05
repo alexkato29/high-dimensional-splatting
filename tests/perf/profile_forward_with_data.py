@@ -17,7 +17,7 @@ def profile_with_real_data(
     data_path: str,
     num_views: int,
     verbose: bool,
-    seed: int
+    seed: int | None
 ) -> List[torch.Tensor]:
     if verbose:
         print(f"=== Profiling with Real COLMAP Data ===")
@@ -40,7 +40,8 @@ def profile_with_real_data(
     if verbose:
         print(f"Initialized {model.xyz.shape[0]:,} Gaussians\n")
 
-    random.seed(seed)
+    if seed: 
+        random.seed(seed)
     selected_views: list = random.sample(dataset.images, min(num_views, len(dataset.images)))
 
     if verbose:
@@ -138,7 +139,7 @@ def main() -> None:
     parser.add_argument(
         '--seed',
         type=int,
-        default=42,
+        default=None,
         help='Random seed'
     )
 
