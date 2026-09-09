@@ -8,6 +8,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include "helpers.h"
 
+
 // TODO: Once backward pass working, we can consider optimizing memory further via lower
 // precision storage of gaussian data (e.g., uint4) to allow even higher vectorization during reads
 
@@ -455,6 +456,7 @@ torch::Tensor rasterize(
 			   cudaMemcpyDeviceToHost);
 	int total_duplicates = last_offset + last_tiles_touched;
 
+
 	uint64_t* tiled_gaussian_keys;
 	int* tiled_gaussian_values;
 
@@ -485,13 +487,23 @@ torch::Tensor rasterize(
 	void* d_temp_storage = nullptr;
 	size_t temp_storage_bytes = 0;
 
+	// Keys are (tile_idx << 32 | depth_bits), so everything above bit 32+ceil(log2(num_tiles))
+	// is always zero. CUB's onesweep does 8 bits per pass, so sorting the full 64 bits
+	// can be wasteful when we aren't using anywhere close to 2^33 - 1 tiles.
+	int num_tiles_total = num_tiles_x * num_tiles_y;
+	int tile_bits = 0;
+	// Use a loop to find the upper bound power of two. Floating point precision makes using
+	// a logarithm directly a bit risky, this is stable.
+	while ((1 << tile_bits) < num_tiles_total) tile_bits++;
+	const int sort_end_bit = 32 + tile_bits;
+
 	// Radix sort needs temporary storage. We don't know exactly how much, but if you pass it
 	// a nullptr it will automatically decide how much it needs.
 	cub::DeviceRadixSort::SortPairs(
 		d_temp_storage, temp_storage_bytes,
 		tiled_gaussian_keys, tiled_gaussian_keys_sorted,
 		tiled_gaussian_values, tiled_gaussian_values_sorted,
-		total_duplicates
+		total_duplicates, 0, sort_end_bit
 	);
 
 	cudaMalloc(&d_temp_storage, temp_storage_bytes);
@@ -500,7 +512,7 @@ torch::Tensor rasterize(
 		d_temp_storage, temp_storage_bytes,
 		tiled_gaussian_keys, tiled_gaussian_keys_sorted,
 		tiled_gaussian_values, tiled_gaussian_values_sorted,
-		total_duplicates
+		total_duplicates, 0, sort_end_bit
 	);
 
 	cudaFree(d_temp_storage);
@@ -519,9 +531,9 @@ torch::Tensor rasterize(
 	check_cuda_error("identify_tile_ranges");
 
 	// Step 3: alpha blend/render the gaussians
-	// We use a 4th channel to allow vectorized writes, but we don't actually care about it
+	// We use a 4th channel to allow vectorized writes, but we don't actually care about it.
 	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-	torch::Tensor output = torch::zeros({image_height, image_width, 4}, options);
+	torch::Tensor output = torch::empty({image_height, image_width, 4}, options);
 
 	float* output_ptr = output.data_ptr<float>();
 
