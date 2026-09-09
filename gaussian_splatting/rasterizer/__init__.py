@@ -28,7 +28,8 @@ def _get_rasterizer() -> Any:
 		extra_cuda_cflags=[
 			"-O3",
 			"--use_fast_math",
-			"-std=c++17"
+			"-std=c++17",
+			"-lineinfo"
 		],
 		extra_cflags=["-O3", "-std=c++17"],
 		verbose=True
