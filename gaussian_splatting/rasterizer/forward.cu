@@ -8,7 +8,6 @@
 #include <cub/device/device_radix_sort.cuh>
 #include "helpers.h"
 
-
 // TODO: Once backward pass working, we can consider optimizing memory further via lower
 // precision storage of gaussian data (e.g., uint4) to allow even higher vectorization during reads
 
@@ -36,6 +35,8 @@ __global__ void project_gaussians(
 	const float* means3D,
 	const float* scales,
 	const float* quaternions,
+	const float* opacities,
+	const float* colors,
 	const float* world_to_cam_matrix,
 	float focal_x,
 	float focal_y,
@@ -48,7 +49,8 @@ __global__ void project_gaussians(
 	int num_tiles_y,
 	float4* gaussian_data,
 	float2* means2D,
-	float4* cov2D,
+	float4* conic,
+	float4* color_opacity,
 	int* tiles_touched
 ) {
 	// Step 1: We must project the gaussian mean to the screen space (u, v)
@@ -94,8 +96,6 @@ __global__ void project_gaussians(
 		focal_y
 	);
 
-	cov2D[idx] = make_float4(cov2D_out.x, cov2D_out.y, cov2D_out.z, 0.0f);
-
 	float radius = compute_radius_from_cov2D(cov2D_out);
 
 	if (is_completely_off_screen(uv, image_width, image_height, radius)) {
@@ -109,6 +109,25 @@ __global__ void project_gaussians(
 	// benefits from one vectorized representation, while render_gaussians only needs means.
 	gaussian_data[idx] = make_float4(uv.x, uv.y, radius, p_cam.z);
 	means2D[idx] = uv;
+
+	// Invert the 2x2 covariance here, once per gaussian, rather than once per (pixel, gaussian)
+	// pair in the render loop. det/det_inv/the three conic products depend only on cov2D, so they
+	// are loop-invariant across pixels.
+	float det = cov2D_out.x * cov2D_out.z - cov2D_out.y * cov2D_out.y;
+	if (det <= 0.0f) {
+		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
+		tiles_touched[idx] = 0;
+		return;
+	}
+	float det_inv = 1.0f / det;
+	conic[idx] = make_float4(
+		cov2D_out.z * det_inv, -cov2D_out.y * det_inv, cov2D_out.x * det_inv, 0.0f);
+
+	// Colour is 12B at 12B alignment, which the compiler must split into three LDG.E.
+	// Padding it to a float4 and parking opacity in the spare lane allows vectorized
+	// access in the render loop.
+	color_opacity[idx] = make_float4(
+		colors[idx*3 + 0], colors[idx*3 + 1], colors[idx*3 + 2], opacities[idx]);
 
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
@@ -168,7 +187,7 @@ __global__ void duplicate_gaussians(
 	/*
 	This kernel initially had "flipped" parallelism and mapped threads to gaussian ids
 	rather than to output indices. That ate away at performance due to massive problems
-	with shuffled writes to global memory. Instead, mapping threads to output indices 
+	with shuffled writes to global memory. Instead, mapping threads to output indices
 	ended up running substantially faster (~x5.5).
 
 	I also tried CSR. Basically, swap binary searches for writes to SMEM:
@@ -181,7 +200,7 @@ __global__ void duplicate_gaussians(
 
 	However, this approach was ultimately slower since the writes to smem ended up leading
 	to warp divergence. Also, gaussians have space in between them in the output (obviously,
-	that is what this kernel solves), so the smem writes weren't coalesced. Plus, caching is 
+	that is what this kernel solves), so the smem writes weren't coalesced. Plus, caching is
 	so effective that the binary search baseline is already hard to beat.
 	*/
 	int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -248,9 +267,8 @@ __global__ void render_gaussians(
 	const uint2* tile_ranges,
 	const int* tiled_gaussian_values_sorted,
 	const float* means2D,
-	const float4* cov2D,
-	const float* colors,
-	const float* opacities,
+	const float4* conic,
+	const float4* color_opacity,
 	int image_width,
 	int image_height,
 	float* output
@@ -274,15 +292,19 @@ __global__ void render_gaussians(
 		int idx = tiled_gaussian_values_sorted[i];
 
 		float2 mean = ((float2*)means2D)[idx];
-		float4 cov = cov2D[idx];
-		float weight = evaluate_gaussian_2d(pixel, mean, cov);
+		float4 c = conic[idx];
 
-		float opacity = opacities[idx];
-		float alpha = opacity * weight;
+		// c = (conic.xx, conic.xy, conic.yy, unused), which we already inverted in project_gaussians.
+		float dx = pixel.x - mean.x;
+		float dy = pixel.y - mean.y;
+		float mahalanobis = dx * (c.x * dx + c.y * dy) +
+							dy * (c.y * dx + c.z * dy);
+		float weight = __expf(-0.5f * mahalanobis);
+
+		float4 color = color_opacity[idx];
+		float alpha = color.w * weight;
 
 		if (alpha < 1e-4f) continue;
-
-		float3 color = ((float3*) colors)[idx];
 
 		accumulated_color.x += alpha * transmittance * color.x;
 		accumulated_color.y += alpha * transmittance * color.y;
@@ -328,12 +350,14 @@ torch::Tensor rasterize(
 	// We just need the output to be a torch tensor, but the rest can be regular dtypes
 	float4* gaussian_data_ptr;  // Packed for duplication: xy=means2D, z=radius, w=depth
 	float2* means2D_ptr;  // Separate for render_gaussians
-	float4* cov2D_ptr;
+	float4* conic_ptr;
+	float4* color_opacity_ptr;
 	int* tiles_touched_ptr;
 
 	cudaMalloc(&gaussian_data_ptr, num_gaussians * sizeof(float4));
 	cudaMalloc(&means2D_ptr, num_gaussians * sizeof(float2));
-	cudaMalloc(&cov2D_ptr, num_gaussians * sizeof(float4));
+	cudaMalloc(&conic_ptr, num_gaussians * sizeof(float4));
+	cudaMalloc(&color_opacity_ptr, num_gaussians * sizeof(float4));
 	cudaMalloc(&tiles_touched_ptr, num_gaussians * sizeof(int));
 
 	// Step 1: Project gaussians from 3D world space to 2D screen space
@@ -344,6 +368,8 @@ torch::Tensor rasterize(
 		means3D_ptr,
 		scales_ptr,
 		quaternions_ptr,
+		opacities_ptr,
+		colors_ptr,
 		world_to_cam_matrix_ptr,
 		focal_x,
 		focal_y,
@@ -356,7 +382,8 @@ torch::Tensor rasterize(
 		num_tiles_y,
 		gaussian_data_ptr,
 		means2D_ptr,
-		cov2D_ptr,
+		conic_ptr,
+		color_opacity_ptr,
 		tiles_touched_ptr
 	);
 	check_cuda_error("project_gaussians");
@@ -367,7 +394,7 @@ torch::Tensor rasterize(
 	Ok, this part is a bit confusing so buckle up. To render a pixel, we need to know which gaussians influence it.
 	Duh. It also needs to be in depth order since we render front to back.
 
-	Naively: you globally sort all the gaussians by depth. Then your renderer, for each pixel, goes through all 
+	Naively: you globally sort all the gaussians by depth. Then your renderer, for each pixel, goes through all
 	gaussians front to back to compute their impact. That is painfully slow. 4k image res * 50k gaussians is
 	414 BILLION comparisons. I actually did that at first, and it took about 6 seconds to do one forward pass.
 
@@ -378,9 +405,9 @@ torch::Tensor rasterize(
 
 	The end goal: have some list tiled_gaussian_ids_sorted that contains gaussiand ids like:
 	[tile0_depth0.1_gaussian123, tile0_depth1.5_gaussian456, ..., tileK_depth23.1_gaussian789]
-	sorted first by tile, then by depth. Only gaussians that touch the tile should be in the list. In this way, 
-	we've basically created per tile gaussian lists. Then, we may have another list tiled_ranges such that 
-	tiled_ranges[tile_idx] tells us the start and end index in tiled_gaussian_ids_sorted that we need to check. 
+	sorted first by tile, then by depth. Only gaussians that touch the tile should be in the list. In this way,
+	we've basically created per tile gaussian lists. Then, we may have another list tiled_ranges such that
+	tiled_ranges[tile_idx] tells us the start and end index in tiled_gaussian_ids_sorted that we need to check.
 	If we can have these two things, then we can check only	relevant gaussians within each tile.
 
 	So how do we get those two lists? Like this (note that gaussian ID/GID just refers to the idx of the gaussian
@@ -406,7 +433,7 @@ torch::Tensor rasterize(
 	5. Traverse the tiled_gaussian_keys_sorted and extract the tile IDs to build tiled_ranges.
 
 	Why tile at all and not just do it per pixel? We're already going to be making TONS of global memory calls.
-	By tiling, we can take advantage of SMEM to ideally make this operation less memory intensie. Sure, some 
+	By tiling, we can take advantage of SMEM to ideally make this operation less memory intensie. Sure, some
 	pixels will ignore some gaussians. But at least we have far fewer unique DRAM calls and DRAM requirements.
 	*/
 	int* offsets_ptr;
@@ -458,7 +485,7 @@ torch::Tensor rasterize(
 	void* d_temp_storage = nullptr;
 	size_t temp_storage_bytes = 0;
 
-	// Radix sort needs temporary storage. We don't know exactly how much, but if you pass it 
+	// Radix sort needs temporary storage. We don't know exactly how much, but if you pass it
 	// a nullptr it will automatically decide how much it needs.
 	cub::DeviceRadixSort::SortPairs(
 		d_temp_storage, temp_storage_bytes,
@@ -505,9 +532,8 @@ torch::Tensor rasterize(
 		tile_ranges,
 		tiled_gaussian_values_sorted,
 		(float*)means2D_ptr,
-		cov2D_ptr,
-		colors_ptr,
-		opacities_ptr,
+		conic_ptr,
+		color_opacity_ptr,
 		image_width,
 		image_height,
 		output_ptr
@@ -516,7 +542,8 @@ torch::Tensor rasterize(
 
 	cudaFree(gaussian_data_ptr);
 	cudaFree(means2D_ptr);
-	cudaFree(cov2D_ptr);
+	cudaFree(conic_ptr);
+	cudaFree(color_opacity_ptr);
 	cudaFree(tiles_touched_ptr);
 	cudaFree(offsets_ptr);
 	cudaFree(tiled_gaussian_keys);
