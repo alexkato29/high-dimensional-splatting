@@ -8,12 +8,16 @@
 #include <cub/device/device_radix_sort.cuh>
 #include "helpers.h"
 
-// Gaussians staged into SMEM per batch. Must equal the render block size (TILE_SIZE^2).
-#define RENDER_BATCH 256
 
+// Tile size in pixels. Compile-time so that RENDER_BATCH is derived from it rather than duplicated.
+// Also, the compiler can optimize pixel_to_tile's integer divisions  into shifts (GPUs have no integer
+// divide instruction, so dividing by a runtime value costs ~15-20 instructions, always avoid).
+#define TILE_SIZE 16
 
-// TODO: Once backward pass working, we can consider optimizing memory further via lower
-// precision storage of gaussian data (e.g., uint4) to allow even higher vectorization during reads
+// Number of gaussians loaded into SMEM per render batch. It must be equal to the block
+// size since each block cooperatively loads gaussians into SMEM.
+#define RENDER_BATCH (TILE_SIZE * TILE_SIZE)
+
 
 inline void check_cuda_error(const char* kernel_name) {
 	cudaError_t err = cudaGetLastError();
@@ -48,7 +52,6 @@ __global__ void project_gaussians(
 	float c_y,
 	int image_width,
 	int image_height,
-	int tile_size,
 	int num_tiles_x,
 	int num_tiles_y,
 	float4* gaussian_data,
@@ -136,8 +139,8 @@ __global__ void project_gaussians(
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
 
-	int2 tile_min_coords = pixel_to_tile(min_pixel, tile_size);
-	int2 tile_max_coords = pixel_to_tile(max_pixel, tile_size);
+	int2 tile_min_coords = pixel_to_tile(min_pixel, TILE_SIZE);
+	int2 tile_max_coords = pixel_to_tile(max_pixel, TILE_SIZE);
 
 	// This should handle partially on screen gaussians. We just clamp it to only on screen tiles,
 	// then we just need to make sure we do the same when duplicating the gaussians.
@@ -181,10 +184,8 @@ __global__ void duplicate_gaussians(
 	int num_gaussians,
 	const int* offsets,
 	const float4* gaussian_data,
-	int tile_size,
 	int num_tiles_x,
 	int num_tiles_y,
-	int tile_cols,
 	uint64_t* tiled_gaussian_keys,
 	int* tiled_gaussian_values
 ) {
@@ -221,8 +222,8 @@ __global__ void duplicate_gaussians(
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
 
-	int2 gaussian_min_tile_coords = pixel_to_tile(min_pixel, tile_size);
-	int2 gaussian_max_tile_coords = pixel_to_tile(max_pixel, tile_size);
+	int2 gaussian_min_tile_coords = pixel_to_tile(min_pixel, TILE_SIZE);
+	int2 gaussian_max_tile_coords = pixel_to_tile(max_pixel, TILE_SIZE);
 
 	gaussian_min_tile_coords.x = max(0, gaussian_min_tile_coords.x);
 	gaussian_min_tile_coords.y = max(0, gaussian_min_tile_coords.y);
@@ -234,7 +235,7 @@ __global__ void duplicate_gaussians(
 	int tile_y = gaussian_min_tile_coords.y + local_idx / gaussian_width;
 	int tile_x = gaussian_min_tile_coords.x + local_idx % gaussian_width;
 
-	int tile_idx = tile_y * tile_cols + tile_x;
+	int tile_idx = tile_y * num_tiles_x + tile_x;
 	uint64_t key = ((uint64_t)tile_idx << 32) | depth_bits;
 
 	tiled_gaussian_keys[output_idx] = key;
@@ -270,7 +271,7 @@ __global__ void identify_tile_ranges(
 __global__ void render_gaussians(
 	const uint2* tile_ranges,
 	const int* tiled_gaussian_values_sorted,
-	const float* means2D,
+	const float2* means2D,
 	const float4* conic,
 	const float4* color_opacity,
 	int image_width,
@@ -324,7 +325,7 @@ __global__ void render_gaussians(
 		int fetch = batch_start + tid;
 		if (fetch < num_todo) {
 			int g = tiled_gaussian_values_sorted[range.x + fetch];
-			s_mean[tid] = ((const float2*)means2D)[g];
+			s_mean[tid] = means2D[g];
 			s_conic[tid] = conic[g];
 			s_color[tid] = color_opacity[g];
 		}
@@ -376,11 +377,21 @@ torch::Tensor rasterize(
 	int image_width,
 	int image_height
 ) {
-	const int TILE_SIZE = 16;
+	auto check_input = [](const torch::Tensor& t, const char* name) {
+		TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+		TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+	};
+	check_input(means3D, "means3D");
+	check_input(scales, "scales");
+	check_input(quaternions, "quaternions");
+	check_input(opacities, "opacities");
+	check_input(colors, "colors");
+	check_input(world_to_cam_matrix, "world_to_cam_matrix");
 
-	int num_gaussians = means3D.size(0);
-	int num_tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
-	int num_tiles_y = (image_height + TILE_SIZE - 1) / TILE_SIZE;
+	const int num_gaussians = means3D.size(0);
+	const int num_tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
+	const int num_tiles_y = (image_height + TILE_SIZE - 1) / TILE_SIZE;
+	const int num_tiles = num_tiles_x * num_tiles_y;
 
 	// These came from python and thus are torch::Tensor types
 	float* means3D_ptr = means3D.data_ptr<float>();
@@ -404,9 +415,10 @@ torch::Tensor rasterize(
 	cudaMalloc(&tiles_touched_ptr, num_gaussians * sizeof(int));
 
 	// Step 1: Project gaussians from 3D world space to 2D screen space
-	int threads = 256;
-	int blocks = (num_gaussians + threads - 1) / threads;
-	project_gaussians<<<blocks, threads>>>(
+	const int threads = 256;
+	auto blocks_for = [threads](int n) { return (n + threads - 1) / threads; };
+
+	project_gaussians<<<blocks_for(num_gaussians), threads>>>(
 		num_gaussians,
 		means3D_ptr,
 		scales_ptr,
@@ -420,7 +432,6 @@ torch::Tensor rasterize(
 		c_y,
 		image_width,
 		image_height,
-		TILE_SIZE,
 		num_tiles_x,
 		num_tiles_y,
 		gaussian_data_ptr,
@@ -454,7 +465,7 @@ torch::Tensor rasterize(
 	If we can have these two things, then we can check only	relevant gaussians within each tile.
 
 	So how do we get those two lists? Like this (note that gaussian ID/GID just refers to the idx of the gaussian
-	in means2D and cov2D):
+	in means2D and conic):
 	0. We know each gaussian touches tiles_touched[GID] and all times in a bounding box from tile_min[GID] to
 	tile_max[GID].
 
@@ -498,6 +509,18 @@ torch::Tensor rasterize(
 			   cudaMemcpyDeviceToHost);
 	int total_duplicates = last_offset + last_tiles_touched;
 
+	if (total_duplicates == 0) {
+		cudaFree(gaussian_data_ptr);
+		cudaFree(means2D_ptr);
+		cudaFree(conic_ptr);
+		cudaFree(color_opacity_ptr);
+		cudaFree(tiles_touched_ptr);
+		cudaFree(offsets_ptr);
+		auto empty_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+		return torch::zeros({image_height, image_width, 3}, empty_options);
+	}
+
+
 
 	uint64_t* tiled_gaussian_keys;
 	int* tiled_gaussian_values;
@@ -506,16 +529,13 @@ torch::Tensor rasterize(
 	cudaMalloc(&tiled_gaussian_values, total_duplicates * sizeof(int));
 
 	// Optimization of this kernel was super fun, see the kernel for info
-	int blocks_reverse = (total_duplicates + threads - 1) / threads;
-	duplicate_gaussians<<<blocks_reverse, threads>>>(
+	duplicate_gaussians<<<blocks_for(total_duplicates), threads>>>(
 		total_duplicates,
 		num_gaussians,
 		offsets_ptr,
 		gaussian_data_ptr,
-		TILE_SIZE,
 		num_tiles_x,
 		num_tiles_y,
-		num_tiles_x,
 		tiled_gaussian_keys,
 		tiled_gaussian_values
 	);
@@ -532,11 +552,10 @@ torch::Tensor rasterize(
 	// Keys are (tile_idx << 32 | depth_bits), so everything above bit 32+ceil(log2(num_tiles))
 	// is always zero. CUB's onesweep does 8 bits per pass, so sorting the full 64 bits
 	// can be wasteful when we aren't using anywhere close to 2^33 - 1 tiles.
-	int num_tiles_total = num_tiles_x * num_tiles_y;
 	int tile_bits = 0;
 	// Use a loop to find the upper bound power of two. Floating point precision makes using
 	// a logarithm directly a bit risky, this is stable.
-	while ((1 << tile_bits) < num_tiles_total) tile_bits++;
+	while ((1 << tile_bits) < num_tiles) tile_bits++;
 	const int sort_end_bit = 32 + tile_bits;
 
 	// Radix sort needs temporary storage. We don't know exactly how much, but if you pass it
@@ -561,11 +580,10 @@ torch::Tensor rasterize(
 	check_cuda_error("radix_sort");
 
 	uint2* tile_ranges;
-	cudaMalloc(&tile_ranges, num_tiles_x * num_tiles_y * sizeof(uint2));
-	cudaMemset(tile_ranges, 0, num_tiles_x * num_tiles_y * sizeof(uint2));
+	cudaMalloc(&tile_ranges, num_tiles * sizeof(uint2));
+	cudaMemset(tile_ranges, 0, num_tiles * sizeof(uint2));
 
-	int blocks_ranges = (total_duplicates + threads - 1) / threads;
-	identify_tile_ranges<<<blocks_ranges, threads>>>(
+	identify_tile_ranges<<<blocks_for(total_duplicates), threads>>>(
 		total_duplicates,
 		tiled_gaussian_keys_sorted,
 		tile_ranges
@@ -585,7 +603,7 @@ torch::Tensor rasterize(
 	render_gaussians<<<grid, block>>>(
 		tile_ranges,
 		tiled_gaussian_values_sorted,
-		(float*)means2D_ptr,
+		means2D_ptr,
 		conic_ptr,
 		color_opacity_ptr,
 		image_width,

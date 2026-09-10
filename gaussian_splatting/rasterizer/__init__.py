@@ -114,7 +114,6 @@ def rasterize(
 	Returns:
 		[H, W, 3] Rendered image (RGB, 0-1 range)
 	"""
-	assert means3D.is_cuda, "means3D must be on CUDA"
 	assert means3D.ndim == 2 and means3D.shape[1] == 3
 	assert scales.shape == means3D.shape
 	assert quaternions.shape == (means3D.shape[0], 4)
