@@ -401,18 +401,22 @@ torch::Tensor rasterize(
 	float* colors_ptr = colors.data_ptr<float>();
 	float* world_to_cam_matrix_ptr = world_to_cam_matrix.data_ptr<float>();
 
-	// We just need the output to be a torch tensor, but the rest can be regular dtypes
-	float4* gaussian_data_ptr;  // Packed for duplication: xy=means2D, z=radius, w=depth
-	float2* means2D_ptr;  // Separate for render_gaussians
-	float4* conic_ptr;
-	float4* color_opacity_ptr;
-	int* tiles_touched_ptr;
+	auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+	auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+	auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+	auto u8  = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
 
-	cudaMalloc(&gaussian_data_ptr, num_gaussians * sizeof(float4));
-	cudaMalloc(&means2D_ptr, num_gaussians * sizeof(float2));
-	cudaMalloc(&conic_ptr, num_gaussians * sizeof(float4));
-	cudaMalloc(&color_opacity_ptr, num_gaussians * sizeof(float4));
-	cudaMalloc(&tiles_touched_ptr, num_gaussians * sizeof(int));
+	torch::Tensor gaussian_data = torch::empty({num_gaussians, 4}, f32);  // xy=means2D, z=radius, w=depth
+	torch::Tensor means2D       = torch::empty({num_gaussians, 2}, f32);
+	torch::Tensor conic         = torch::empty({num_gaussians, 4}, f32);
+	torch::Tensor color_opacity = torch::empty({num_gaussians, 4}, f32);
+	torch::Tensor tiles_touched = torch::empty({num_gaussians}, i32);
+
+	float4* gaussian_data_ptr = reinterpret_cast<float4*>(gaussian_data.data_ptr<float>());
+	float2* means2D_ptr       = reinterpret_cast<float2*>(means2D.data_ptr<float>());
+	float4* conic_ptr         = reinterpret_cast<float4*>(conic.data_ptr<float>());
+	float4* color_opacity_ptr = reinterpret_cast<float4*>(color_opacity.data_ptr<float>());
+	int*    tiles_touched_ptr = tiles_touched.data_ptr<int>();
 
 	// Step 1: Project gaussians from 3D world space to 2D screen space
 	const int threads = 256;
@@ -490,8 +494,8 @@ torch::Tensor rasterize(
 	By tiling, we can take advantage of SMEM to ideally make this operation less memory intensie. Sure, some
 	pixels will ignore some gaussians. But at least we have far fewer unique DRAM calls and DRAM requirements.
 	*/
-	int* offsets_ptr;
-	cudaMalloc(&offsets_ptr, num_gaussians * sizeof(int));
+	torch::Tensor offsets = torch::empty({num_gaussians}, i32);
+	int* offsets_ptr = offsets.data_ptr<int>();
 
 	thrust::device_ptr<int> tiles_touched_thrust(tiles_touched_ptr);
 	thrust::device_ptr<int> offsets_thrust(offsets_ptr);
@@ -510,23 +514,16 @@ torch::Tensor rasterize(
 	int total_duplicates = last_offset + last_tiles_touched;
 
 	if (total_duplicates == 0) {
-		cudaFree(gaussian_data_ptr);
-		cudaFree(means2D_ptr);
-		cudaFree(conic_ptr);
-		cudaFree(color_opacity_ptr);
-		cudaFree(tiles_touched_ptr);
-		cudaFree(offsets_ptr);
-		auto empty_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-		return torch::zeros({image_height, image_width, 3}, empty_options);
+		return torch::zeros({image_height, image_width, 3}, f32);
 	}
 
 
 
-	uint64_t* tiled_gaussian_keys;
-	int* tiled_gaussian_values;
+	torch::Tensor keys   = torch::empty({total_duplicates}, i64);
+	torch::Tensor values = torch::empty({total_duplicates}, i32);
 
-	cudaMalloc(&tiled_gaussian_keys, total_duplicates * sizeof(uint64_t));
-	cudaMalloc(&tiled_gaussian_values, total_duplicates * sizeof(int));
+	uint64_t* tiled_gaussian_keys   = reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>());
+	int*      tiled_gaussian_values = values.data_ptr<int>();
 
 	// Optimization of this kernel was super fun, see the kernel for info
 	duplicate_gaussians<<<blocks_for(total_duplicates), threads>>>(
@@ -541,10 +538,11 @@ torch::Tensor rasterize(
 	);
 	check_cuda_error("duplicate_gaussians");
 
-	uint64_t* tiled_gaussian_keys_sorted;
-	int* tiled_gaussian_values_sorted;
-	cudaMalloc(&tiled_gaussian_keys_sorted, total_duplicates * sizeof(uint64_t));
-	cudaMalloc(&tiled_gaussian_values_sorted, total_duplicates * sizeof(int));
+	torch::Tensor keys_sorted   = torch::empty({total_duplicates}, i64);
+	torch::Tensor values_sorted = torch::empty({total_duplicates}, i32);
+
+	uint64_t* tiled_gaussian_keys_sorted   = reinterpret_cast<uint64_t*>(keys_sorted.data_ptr<int64_t>());
+	int*      tiled_gaussian_values_sorted = values_sorted.data_ptr<int>();
 
 	void* d_temp_storage = nullptr;
 	size_t temp_storage_bytes = 0;
@@ -567,7 +565,8 @@ torch::Tensor rasterize(
 		total_duplicates, 0, sort_end_bit
 	);
 
-	cudaMalloc(&d_temp_storage, temp_storage_bytes);
+	torch::Tensor temp_storage = torch::empty({(int64_t)temp_storage_bytes}, u8);
+	d_temp_storage = temp_storage.data_ptr();
 
 	cub::DeviceRadixSort::SortPairs(
 		d_temp_storage, temp_storage_bytes,
@@ -576,12 +575,10 @@ torch::Tensor rasterize(
 		total_duplicates, 0, sort_end_bit
 	);
 
-	cudaFree(d_temp_storage);
 	check_cuda_error("radix_sort");
 
-	uint2* tile_ranges;
-	cudaMalloc(&tile_ranges, num_tiles * sizeof(uint2));
-	cudaMemset(tile_ranges, 0, num_tiles * sizeof(uint2));
+	torch::Tensor tile_ranges_t = torch::zeros({num_tiles, 2}, i32);
+	uint2* tile_ranges = reinterpret_cast<uint2*>(tile_ranges_t.data_ptr<int>());
 
 	identify_tile_ranges<<<blocks_for(total_duplicates), threads>>>(
 		total_duplicates,
@@ -592,8 +589,7 @@ torch::Tensor rasterize(
 
 	// Step 3: alpha blend/render the gaussians
 	// We use a 4th channel to allow vectorized writes, but we don't actually care about it.
-	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-	torch::Tensor output = torch::empty({image_height, image_width, 4}, options);
+	torch::Tensor output = torch::empty({image_height, image_width, 4}, f32);
 
 	float* output_ptr = output.data_ptr<float>();
 
@@ -611,18 +607,6 @@ torch::Tensor rasterize(
 		output_ptr
 	);
 	check_cuda_error("render_gaussians");
-
-	cudaFree(gaussian_data_ptr);
-	cudaFree(means2D_ptr);
-	cudaFree(conic_ptr);
-	cudaFree(color_opacity_ptr);
-	cudaFree(tiles_touched_ptr);
-	cudaFree(offsets_ptr);
-	cudaFree(tiled_gaussian_keys);
-	cudaFree(tiled_gaussian_values);
-	cudaFree(tiled_gaussian_keys_sorted);
-	cudaFree(tiled_gaussian_values_sorted);
-	cudaFree(tile_ranges);
 
 	// Drop the useless 4th channel here, torch can do this for free functionally
 	return output.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
