@@ -8,6 +8,9 @@
 #include <cub/device/device_radix_sort.cuh>
 #include "helpers.h"
 
+// Gaussians staged into SMEM per batch. Must equal the render block size (TILE_SIZE^2).
+#define RENDER_BATCH 256
+
 
 // TODO: Once backward pass working, we can consider optimizing memory further via lower
 // precision storage of gaussian data (e.g., uint4) to allow even higher vectorization during reads
@@ -274,50 +277,89 @@ __global__ void render_gaussians(
 	int image_height,
 	float* output
 ) {
+	/*
+	Every thread in this block renders a pixel of the SAME tile, so every warp walks the same
+	gaussian list. Reading that list straight from global memory meant all 8 warps issued their
+	own loads for the same addresses. L1 served them (had a91% hit rate, DRAM idle at 13%) but
+	the L1/TEX unit itself saturated at ~82% doing 8x redundant request processing.
+
+	We stage a batch of gaussians into shared memory once per block, cooperatively, then let
+	every warp read from SMEM. Shared memory is the same physical SRAM as L1 but reached by a
+	different path (no tag lookup nor cache line handling) so it costs LSU slots (which had
+	~40% headroom) instead of L1/TEX throughput (which had none). All 32 threads in a warp read
+	the same SMEM address, which is a broadcast: one cycle, no bank conflicts.
+
+	The batch barrier also gives block-wide early termination for free. Previously a saturated
+	pixel broke its own loop but its block kept running until every pixel finished, now
+	__syncthreads_count lets the whole block bail once all 256 pixels are opaque.
+	*/
+	const int block_size = blockDim.x * blockDim.y;
+	int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
 	int px = blockIdx.x * blockDim.x + threadIdx.x;
 	int py = blockIdx.y * blockDim.y + threadIdx.y;
 	int tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
 
-	if (px >= image_width || py >= image_height) return;
+	// Out-of-bounds threads cannot return early: they still have to help fetch and, more
+	// importantly, they have to keep hitting the __syncthreads barriers below.
+	bool inside = (px < image_width && py < image_height);
 
 	float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 
-	float4 accumulated_color = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-	float transmittance = 1.0f;
+	__shared__ float2 s_mean[RENDER_BATCH];
+	__shared__ float4 s_conic[RENDER_BATCH];
+	__shared__ float4 s_color[RENDER_BATCH];
 
 	uint2 range = tile_ranges[tile_idx];
-	int start_idx = range.x;
-	int end_idx = range.y;
+	int num_todo = (int)range.y - (int)range.x;
 
-	for (int i = start_idx; i < end_idx; i++) {
-		int idx = tiled_gaussian_values_sorted[i];
+	float4 accumulated_color = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float transmittance = 1.0f;
+	bool done = !inside;
 
-		float2 mean = ((float2*)means2D)[idx];
-		float4 c = conic[idx];
+	for (int batch_start = 0; batch_start < num_todo; batch_start += block_size) {
+		// Doubles as the barrier protecting last iteration's SMEM reads from this iteration's writes.
+		if (__syncthreads_count(done) == block_size) break;
 
-		// c = (conic.xx, conic.xy, conic.yy, unused), which we already inverted in project_gaussians.
-		float dx = pixel.x - mean.x;
-		float dy = pixel.y - mean.y;
-		float mahalanobis = dx * (c.x * dx + c.y * dy) +
-							dy * (c.y * dx + c.z * dy);
-		float weight = __expf(-0.5f * mahalanobis);
+		int fetch = batch_start + tid;
+		if (fetch < num_todo) {
+			int g = tiled_gaussian_values_sorted[range.x + fetch];
+			s_mean[tid] = ((const float2*)means2D)[g];
+			s_conic[tid] = conic[g];
+			s_color[tid] = color_opacity[g];
+		}
+		__syncthreads();
 
-		float4 color = color_opacity[idx];
-		float alpha = color.w * weight;
+		int batch_count = min(block_size, num_todo - batch_start);
+		for (int j = 0; j < batch_count && !done; j++) {
+			float2 mean = s_mean[j];
+			float4 c = s_conic[j];
 
-		if (alpha < 1e-4f) continue;
+			// c = (conic.xx, conic.xy, conic.yy, unused), already inverted in project_gaussians.
+			float dx = pixel.x - mean.x;
+			float dy = pixel.y - mean.y;
+			float mahalanobis = dx * (c.x * dx + c.y * dy) +
+								dy * (c.y * dx + c.z * dy);
+			float weight = __expf(-0.5f * mahalanobis);
 
-		accumulated_color.x += alpha * transmittance * color.x;
-		accumulated_color.y += alpha * transmittance * color.y;
-		accumulated_color.z += alpha * transmittance * color.z;
+			float4 color = s_color[j];
+			float alpha = color.w * weight;
 
-		transmittance *= (1.0f - alpha);
+			if (alpha < 1e-4f) continue;
 
-		if (transmittance < 1e-3f) break;
+			accumulated_color.x += alpha * transmittance * color.x;
+			accumulated_color.y += alpha * transmittance * color.y;
+			accumulated_color.z += alpha * transmittance * color.z;
+
+			transmittance *= (1.0f - alpha);
+
+			if (transmittance < 1e-3f) done = true;
+		}
 	}
 
-	int pixel_idx = py * image_width + px;
-	((float4*)output)[pixel_idx] = accumulated_color;
+	if (inside) {
+		((float4*)output)[py * image_width + px] = accumulated_color;
+	}
 }
 
 torch::Tensor rasterize(
