@@ -1,29 +1,30 @@
+import random
 import sys
 import time
-import torch
-import random
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import torch
 from PIL import Image
 
 from gaussian_splatting.config import TrainingParams
-from gaussian_splatting.utils.dataset import ColmapDataset, RawImage
-from gaussian_splatting.utils.gaussian import GaussianModel
 from gaussian_splatting.rasterizer import rasterize
+from gaussian_splatting.utils.dataset import Camera, ColmapDataset
+from gaussian_splatting.utils.gaussian import GaussianModel
 
 
-def render(camera: RawImage, gaussians: GaussianModel) -> torch.Tensor:
+def render(camera: Camera, gaussians: GaussianModel) -> torch.Tensor:
 	rendered = rasterize(
 		means3D=gaussians.xyz,
 		scales=gaussians.scales,
 		quaternions=gaussians.quaternions,
 		opacities=gaussians.opacities,
 		colors=gaussians.rgb,
-		world_to_cam_matrix=camera.world_to_camera_matrix,
-		focal_x=float(camera.focal_x),
-		focal_y=float(camera.focal_y),
-		c_x=float(camera.c_x),
-		c_y=float(camera.c_y),
+		world_to_cam_matrix=camera.world_to_camera,
+		focal_x=camera.fx,
+		focal_y=camera.fy,
+		c_x=camera.cx,
+		c_y=camera.cy,
 		image_width=camera.width,
 		image_height=camera.height
 	)
@@ -48,7 +49,7 @@ def save_images(output_dir: Path, iteration: int, rendered: torch.Tensor, gt: to
 def train(data_path: str) -> None:
 	print(f"Loading dataset from {data_path}")
 	dataset: ColmapDataset = ColmapDataset(data_path)
-	print(f"Loaded {len(dataset.images)} images and {len(dataset.point_cloud.points)} points")
+	print(f"Loaded {len(dataset.train_cameras)} train / {len(dataset.test_cameras)} test images and {len(dataset.point_cloud.points)} points")
 
 	model: GaussianModel = GaussianModel(dataset.point_cloud)
 	print(f"Initialized {model.xyz.shape[0]} Gaussians")
@@ -65,10 +66,10 @@ def train(data_path: str) -> None:
 	times: list[float] = []
 	for iteration in range(params.iterations):
 		start: float = time.time()
-		image: RawImage = random.choice(dataset.images)
-		gt_image: torch.Tensor = image.load_image(device='cuda' if torch.cuda.is_available() else 'cpu')
+		camera: Camera = random.choice(dataset.train_cameras)
+		gt_image: torch.Tensor = camera.image.float() / 255.0
 
-		rendered_image = render(image, model)
+		rendered_image = render(camera, model)
 
 		loss: torch.Tensor = torch.nn.functional.mse_loss(rendered_image, gt_image)
 
