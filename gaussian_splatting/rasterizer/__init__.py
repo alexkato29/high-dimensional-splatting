@@ -1,8 +1,9 @@
 import os
-import torch
-from typing import Any, Optional
-from torch.utils.cpp_extension import load
 from pathlib import Path
+from typing import Any, Optional
+
+import torch
+from torch.utils.cpp_extension import load
 
 _rasterizer_module: Optional[Any] = None
 

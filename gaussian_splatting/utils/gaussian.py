@@ -1,8 +1,10 @@
 from typing import Any
-from scipy.spatial import KDTree
+
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.spatial import KDTree
+
 from gaussian_splatting.config import TrainingParams
 from gaussian_splatting.utils.dataset import PointCloud
 
