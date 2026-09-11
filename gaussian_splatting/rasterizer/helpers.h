@@ -161,7 +161,7 @@ __device__ inline float3 project_cov_matrix(
 }
 
 __device__ inline float compute_radius_from_cov2D(float3 cov) {
-	// We are solving the characterisitc polynomial here
+	// We are solving the characteristic polynomial here
 	float trace = cov.x + cov.z;
 	float det = cov.x * cov.z - cov.y * cov.y;
 

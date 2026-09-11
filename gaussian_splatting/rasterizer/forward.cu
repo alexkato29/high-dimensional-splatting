@@ -130,7 +130,7 @@ __global__ void project_gaussians(
 	conic[idx] = make_float4(
 		cov2D_out.z * det_inv, -cov2D_out.y * det_inv, cov2D_out.x * det_inv, 0.0f);
 
-	// Colour is 12B at 12B alignment, which the compiler must split into three LDG.E.
+	// Color is 12B at 12B alignment, which the compiler must split into three LDG.E.
 	// Padding it to a float4 and parking opacity in the spare lane allows vectorized
 	// access in the render loop.
 	color_opacity[idx] = make_float4(
