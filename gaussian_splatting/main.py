@@ -15,11 +15,11 @@ from gaussian_splatting.utils.gaussian import GaussianModel
 
 def render(camera: Camera, gaussians: GaussianModel) -> torch.Tensor:
 	rendered = rasterize(
-		means3D=gaussians.xyz,
+		means3D=gaussians.means,
 		scales=gaussians.scales,
-		quaternions=gaussians.quaternions,
+		quaternions=gaussians.quats,
 		opacities=gaussians.opacities,
-		colors=gaussians.rgb,
+		colors=gaussians.colors(camera.center),
 		world_to_cam_matrix=camera.world_to_camera,
 		focal_x=camera.fx,
 		focal_y=camera.fy,
@@ -52,7 +52,7 @@ def train(data_path: str) -> None:
 	print(f"Loaded {len(dataset.train_cameras)} train / {len(dataset.test_cameras)} test images and {len(dataset.point_cloud.points)} points")
 
 	model: GaussianModel = GaussianModel(dataset.point_cloud)
-	print(f"Initialized {model.xyz.shape[0]} Gaussians")
+	print(f"Initialized {model.means.shape[0]} Gaussians")
 
 	params: TrainingParams = TrainingParams()
 	optimizer = torch.optim.Adam(params=model.get_optimizer_params(), eps=1e-15)

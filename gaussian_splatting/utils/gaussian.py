@@ -1,96 +1,84 @@
 from typing import Any
 
-import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from scipy.spatial import KDTree
 
 from gaussian_splatting.config import TrainingParams
 from gaussian_splatting.utils.dataset import PointCloud
+from gaussian_splatting.utils.sh import eval_sh, num_sh_coeffs, rgb_to_sh
 
 
-class GaussianModel(nn.Module):
-	def __init__(self, point_cloud: PointCloud, device: str | None = None):
-		super().__init__()
+class GaussianModel:
+	"""
+	The learnable gaussians. Each parameter is stored unconstrained, so Adam can step it freely, and
+	mapped through an activation on read that enforces what it must satisfy: scales positive (exp),
+	opacity in (0, 1) (sigmoid), rotation a unit quaternion (normalize).
 
-		self._xyz: nn.Parameter
-		self._scales: nn.Parameter
-		self._quaternions: nn.Parameter
-		self._opacities: nn.Parameter
-		self._rgb: nn.Parameter
-		self.device: str = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+	All parameters live in one dict so densification can add or remove gaussians by applying the same
+	index or concatenation to every entry, and to the matching optimizer state, without naming each one.
+	"""
+	def __init__(self, point_cloud: PointCloud, max_sh_degree: int = 3, device: str = "cuda"):
+		means = torch.from_numpy(point_cloud.points)
+		n = len(means)
 
-		self._initialize_from_point_cloud(point_cloud)
+		# Each gaussian starts as an isotropic blob whose standard deviation is the RMS distance to its 3
+		# nearest neighbors, so neighboring splats overlap enough to cover the surface without holes.
+		# k=4 because each point's nearest neighbor is itself.
+		dists, _ = KDTree(point_cloud.points).query(point_cloud.points, k=4)
+		dist2 = torch.from_numpy((dists[:, 1:] ** 2).mean(axis=1)).float().clamp_min(1e-7)
+		scales = torch.log(torch.sqrt(dist2)).unsqueeze(-1).repeat(1, 3)
 
-	def _initialize_from_point_cloud(self, point_cloud: PointCloud) -> None:
-		num_points: int = len(point_cloud.points)
+		# Degree 0 reproduces the point cloud's colors exactly, higher degrees start at zero.
+		sh = torch.zeros(n, num_sh_coeffs(max_sh_degree), 3)
+		sh[:, 0] = rgb_to_sh(torch.from_numpy(point_cloud.colors))
 
-		# We use SciPy to compute distances between points. We, for now,
-		# leave it off the GPU to avoid redundant data transfer overhead
-		cpu_xyz: torch.Tensor = torch.tensor(point_cloud.points, dtype=torch.float32)
-
-		dist: torch.Tensor = torch.clamp_min(self._compute_nearest_neighbor_dist(cpu_xyz), 1e-7)
-		# This makes shape [d1, d2, ...] -> [[d1.1, d1.2, d1.3], [d2.1, d2.2, d2.3], ...]
-		scales: torch.Tensor = torch.log(dist).unsqueeze(-1).repeat(1, 3)
-		self._scales = nn.Parameter(scales.to(self.device), requires_grad=True)
-
-		self._xyz = nn.Parameter(
-			cpu_xyz.to(self.device),
-			requires_grad=True
-		)
-
-		self._quaternions = nn.Parameter(
-			torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32).repeat(num_points, 1).to(self.device),
-			requires_grad=True
-		)
-
-		opacities: torch.Tensor = self._inverse_sigmoid(
-			0.1 * torch.ones((num_points, 1), dtype=torch.float32)
-		)
-		self._opacities = nn.Parameter(opacities.to(self.device), requires_grad=True)
-
-		self._rgb = nn.Parameter(
-			torch.tensor(point_cloud.colors, dtype=torch.float32).to(self.device),
-			requires_grad=True
-		)
-
-	def _compute_nearest_neighbor_dist(self, cpu_points: torch.Tensor) -> torch.Tensor:
-		points: np.ndarray = cpu_points.numpy()
-		tree: KDTree = KDTree(points)
-		distances, _ = tree.query(points, k=2)
-		return torch.tensor(distances[:, 1], dtype=torch.float32)
-
-	def _inverse_sigmoid(self, x: torch.Tensor) -> torch.Tensor:
-		return torch.log(x / (1 - x))
+		self.params: dict[str, torch.nn.Parameter] = {
+			name: torch.nn.Parameter(value.contiguous().to(device))
+			for name, value in {
+				"means": means,
+				"scales": scales,
+				"quats": torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(n, 1),
+				"opacities": torch.logit(torch.full((n, 1), 0.1)),
+				# Split so the higher degrees can learn more slowly than the base color.
+				"sh_dc": sh[:, :1],
+				"sh_rest": sh[:, 1:],
+			}.items()
+		}
+		self.max_sh_degree = max_sh_degree
+		# Training starts at degree 0 (a plain color) and raises this over time, so the optimizer gets
+		# geometry and base color right before it can explain errors away with view-dependent effects.
+		self.active_sh_degree = 0
 
 	@property
-	def xyz(self) -> torch.Tensor:
-		return self._xyz
+	def means(self) -> torch.Tensor:
+		return self.params["means"]
 
 	@property
 	def scales(self) -> torch.Tensor:
-		return torch.exp(self._scales)
+		return torch.exp(self.params["scales"])
 
 	@property
-	def quaternions(self) -> torch.Tensor:
-		return self._quaternions / torch.norm(self._quaternions, dim=1, keepdim=True)
+	def quats(self) -> torch.Tensor:
+		return F.normalize(self.params["quats"], dim=-1)
 
 	@property
 	def opacities(self) -> torch.Tensor:
-		return torch.sigmoid(self._opacities)
+		return torch.sigmoid(self.params["opacities"])
 
-	@property
-	def rgb(self) -> torch.Tensor:
-		return torch.sigmoid(self._rgb)
+	def colors(self, camera_center: torch.Tensor) -> torch.Tensor:
+		"""[N, 3] RGB of every gaussian as seen from camera_center."""
+		dirs = F.normalize(self.means - camera_center, dim=-1)
+		sh = torch.cat([self.params["sh_dc"], self.params["sh_rest"]], dim=1)
+		return eval_sh(sh, dirs, self.active_sh_degree)
 
 	def get_optimizer_params(self) -> list[dict[str, Any]]:
-		params: TrainingParams = TrainingParams()
+		lrs = TrainingParams()
 		return [
-			{'params': [self._xyz], 'lr': params.position_lr, "name": "xyz"},
-			{'params': [self._scales], 'lr': params.scaling_lr, "name": "scaling_vecs"},
-			{'params': [self._quaternions], 'lr': params.rotation_lr, "name": "quaternions"},
-			{'params': [self._opacities], 'lr': params.opacity_lr, "name": "opacities"},
-			{'params': [self._rgb], 'lr': params.rgb_lr, "name": "rgb"}
+			{"params": [self.params["means"]], "lr": lrs.position_lr, "name": "means"},
+			{"params": [self.params["scales"]], "lr": lrs.scaling_lr, "name": "scales"},
+			{"params": [self.params["quats"]], "lr": lrs.rotation_lr, "name": "quats"},
+			{"params": [self.params["opacities"]], "lr": lrs.opacity_lr, "name": "opacities"},
+			{"params": [self.params["sh_dc"]], "lr": lrs.sh_dc_lr, "name": "sh_dc"},
+			{"params": [self.params["sh_rest"]], "lr": lrs.sh_rest_lr, "name": "sh_rest"},
 		]
-
-	# CRITICAL TODO: I need to be able to split and prune gaussians.

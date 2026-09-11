@@ -20,6 +20,11 @@ class Camera:
 	height: int
 	image: torch.Tensor  # [H, W, 3] uint8.
 
+	@property
+	def center(self) -> torch.Tensor:
+		"""Camera position in world space."""
+		return self.world_to_camera.inverse()[:3, 3]
+
 
 @dataclass
 class PointCloud:
@@ -52,7 +57,7 @@ class ColmapDataset:
 
 		# Radius of the training cameras around their centroid, padded 10%. Scales the
 		# position learning rate and densification thresholds to the scene's size.
-		centers = torch.stack([c.world_to_camera.inverse()[:3, 3] for c in self.train_cameras])
+		centers = torch.stack([c.center for c in self.train_cameras])
 		self.extent: float = 1.1 * (centers - centers.mean(dim=0)).norm(dim=1).max().item()
 
 	def _load_camera(self, colmap_img: pycolmap.Image, images_dir: Path, max_width: int | None, device: str) -> Camera:

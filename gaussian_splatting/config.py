@@ -5,4 +5,5 @@ class TrainingParams:
 		self.opacity_lr: float = 0.025
 		self.scaling_lr: float = 0.005
 		self.rotation_lr: float = 0.001
-		self.rgb_lr: float = 0.0025
+		self.sh_dc_lr: float = 0.0025
+		self.sh_rest_lr: float = 0.0025 / 20
