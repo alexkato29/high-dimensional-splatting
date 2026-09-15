@@ -1,15 +1,3 @@
-"""
-Spherical harmonics (SH): how a gaussian's color changes with the direction it is viewed from.
-
-A view-dependent color is a function on the sphere of directions. SH are the sphere's version of a
-Fourier series: fixed basis functions of increasing angular frequency, where a function is stored as
-one weight per basis function. Degree l adds 2l + 1 functions, so degrees 0-3 give 1 + 3 + 5 + 7 = 16
-weights per color channel. The weights are learned; the basis functions below are fixed math.
-
-The constants scale each basis function to unit energy over the sphere. They are derived, not tuned:
-the constant function c needs c^2 * 4pi = 1 (the sphere's area is 4pi), so c = 1 / (2 sqrt(pi)) = C0.
-Polynomials, signs and ordering match the reference implementation, so trained models interchange.
-"""
 import torch
 
 C0 = 0.28209479177387814
