@@ -6,7 +6,6 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sequence.h>
 #include <cub/device/device_radix_sort.cuh>
-#include "helpers.h"
 
 
 // Tile size in pixels. Compile-time so that RENDER_BATCH is derived from it rather than duplicated.
@@ -18,6 +17,10 @@
 // size since each block cooperatively loads gaussians into SMEM.
 #define RENDER_BATCH (TILE_SIZE * TILE_SIZE)
 
+
+__device__ inline int2 pixel_to_tile(float2 pixel) {
+	return make_int2(static_cast<int>(pixel.x) / TILE_SIZE, static_cast<int>(pixel.y) / TILE_SIZE);
+}
 
 inline void check_cuda_error(const char* kernel_name) {
 	cudaError_t err = cudaGetLastError();
@@ -38,112 +41,49 @@ inline void check_cuda_error(const char* kernel_name) {
 	}
 }
 
-__global__ void project_gaussians(
+__global__ void prepare_gaussians(
 	int num_gaussians,
-	const float* means3D,
-	const float* scales,
-	const float* quaternions,
-	const float* opacities,
+	const float2* means2D,
+	const float* depths,
+	const float* radii,
+	const float* conics,
 	const float* colors,
-	const float* world_to_cam_matrix,
-	float focal_x,
-	float focal_y,
-	float c_x,
-	float c_y,
-	int image_width,
-	int image_height,
+	const float* opacities,
 	int num_tiles_x,
 	int num_tiles_y,
 	float4* gaussian_data,
-	float2* means2D,
 	float4* conic,
 	float4* color_opacity,
 	int* tiles_touched
 ) {
-	// Step 1: We must project the gaussian mean to the screen space (u, v)
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= num_gaussians) return;
 
-	float3 p_world = load_float3(means3D, idx);
-	float3 p_cam = world_to_camera(world_to_cam_matrix, p_world);
-
-	// We cull along the way to avoid any and all unnecessary work
-	// This causes warp divergence, so we will have to see if it impacts perf
-	if (is_behind_camera(p_cam.z, 0.2f)) {
-		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
-		means2D[idx] = make_float2(0.0f, 0.0f);
+	// Culled gaussians have radius 0. Written as !(radius > 0) so a NaN radius is culled too.
+	float radius = radii[idx];
+	if (!(radius > 0.0f)) {
 		tiles_touched[idx] = 0;
 		return;
 	}
 
-	float2 uv = pinhole_projection(p_cam, focal_x, focal_y, c_x, c_y);
+	// duplicate_gaussians is memory bound and wants everything it needs in one vectorized load,
+	// while render_gaussians only reads the means, so the means live in both places.
+	float2 uv = means2D[idx];
+	gaussian_data[idx] = make_float4(uv.x, uv.y, radius, depths[idx]);
 
-	if (is_centered_off_screen(uv, image_width, image_height)) {
-		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
-		means2D[idx] = make_float2(0.0f, 0.0f);
-		tiles_touched[idx] = 0;
-		return;
-	}
-
-	// Step 2: We project the 3D covariance matrix to 2D
-	float3 scale = load_float3(scales, idx);
-	float4 quat = load_float4(quaternions, idx);
-
-	float R[9];
-	quat_to_rotmat(quat, R);
-
-	float cov3D[6];
-	compute_cov3D(scale, R, cov3D);
-
-	float3 cov2D_out = project_cov_matrix(
-		cov3D,
-		p_cam,
-		world_to_cam_matrix,
-		focal_x,
-		focal_y
-	);
-
-	float radius = compute_radius_from_cov2D(cov2D_out);
-
-	if (is_completely_off_screen(uv, image_width, image_height, radius)) {
-		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
-		means2D[idx] = make_float2(0.0f, 0.0f);
-		tiles_touched[idx] = 0;
-		return;
-	}
-
-	// Seems repetitive, but we do this because duplicate_gaussians is extremely memory bound and
-	// benefits from one vectorized representation, while render_gaussians only needs means.
-	gaussian_data[idx] = make_float4(uv.x, uv.y, radius, p_cam.z);
-	means2D[idx] = uv;
-
-	// Invert the 2x2 covariance here, once per gaussian, rather than once per (pixel, gaussian)
-	// pair in the render loop. det/det_inv/the three conic products depend only on cov2D, so they
-	// are loop-invariant across pixels.
-	float det = cov2D_out.x * cov2D_out.z - cov2D_out.y * cov2D_out.y;
-	if (det <= 0.0f) {
-		gaussian_data[idx] = make_float4(0.0f, 0.0f, 0.0f, 1e10f);
-		tiles_touched[idx] = 0;
-		return;
-	}
-	float det_inv = 1.0f / det;
-	conic[idx] = make_float4(
-		cov2D_out.z * det_inv, -cov2D_out.y * det_inv, cov2D_out.x * det_inv, 0.0f);
-
-	// Color is 12B at 12B alignment, which the compiler must split into three LDG.E.
-	// Padding it to a float4 and parking opacity in the spare lane allows vectorized
+	// Color and conic are 12B at 12B alignment, which the compiler must split into three LDG.E.
+	// Padding each to a float4 (opacity parked in the color's spare lane) allows vectorized
 	// access in the render loop.
+	conic[idx] = make_float4(conics[idx*3 + 0], conics[idx*3 + 1], conics[idx*3 + 2], 0.0f);
 	color_opacity[idx] = make_float4(
 		colors[idx*3 + 0], colors[idx*3 + 1], colors[idx*3 + 2], opacities[idx]);
 
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
 
-	int2 tile_min_coords = pixel_to_tile(min_pixel, TILE_SIZE);
-	int2 tile_max_coords = pixel_to_tile(max_pixel, TILE_SIZE);
+	int2 tile_min_coords = pixel_to_tile(min_pixel);
+	int2 tile_max_coords = pixel_to_tile(max_pixel);
 
-	// This should handle partially on screen gaussians. We just clamp it to only on screen tiles,
-	// then we just need to make sure we do the same when duplicating the gaussians.
 	tile_min_coords.x = max(0, tile_min_coords.x);
 	tile_min_coords.y = max(0, tile_min_coords.y);
 	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
@@ -157,8 +97,6 @@ __device__ int find_gaussian_binary_search(
 	int num_gaussians,
 	int output_idx
 ) {
-	// Cheap despite the scattered look: early probes hit the same few offsets across all threads, so
-	// they stay in L1/L2. See docs/rasterizer.md.
 	int left = 0;
 	int right = num_gaussians - 1;
 
@@ -183,8 +121,6 @@ __global__ void duplicate_gaussians(
 	uint64_t* tiled_gaussian_keys,
 	int* tiled_gaussian_values
 ) {
-	// One thread per output (duplicate) index, not per gaussian: ~5.5x faster, since writes stay
-	// coalesced. Alternatives tried and why they lost: docs/rasterizer.md.
 	int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (output_idx >= num_duplicates) return;
 
@@ -199,8 +135,8 @@ __global__ void duplicate_gaussians(
 	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
 	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
 
-	int2 gaussian_min_tile_coords = pixel_to_tile(min_pixel, TILE_SIZE);
-	int2 gaussian_max_tile_coords = pixel_to_tile(max_pixel, TILE_SIZE);
+	int2 gaussian_min_tile_coords = pixel_to_tile(min_pixel);
+	int2 gaussian_max_tile_coords = pixel_to_tile(max_pixel);
 
 	gaussian_min_tile_coords.x = max(0, gaussian_min_tile_coords.x);
 	gaussian_min_tile_coords.y = max(0, gaussian_min_tile_coords.y);
@@ -255,8 +191,6 @@ __global__ void render_gaussians(
 	int image_height,
 	float* output
 ) {
-	// All pixels in a block share one gaussian list, so each batch is staged through SMEM once per
-	// block instead of every warp re-requesting it from L1. See docs/rasterizer.md.
 	const int block_size = blockDim.x * blockDim.y;
 	int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
@@ -264,7 +198,7 @@ __global__ void render_gaussians(
 	int py = blockIdx.y * blockDim.y + threadIdx.y;
 	int tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
 
-	// Out-of-bounds threads cannot return early: they still have to help fetch and, more
+	// Out-of-bounds threads cannot return early, they still have to help fetch and, more
 	// importantly, they have to keep hitting the __syncthreads barriers below.
 	bool inside = (px < image_width && py < image_height);
 
@@ -299,7 +233,7 @@ __global__ void render_gaussians(
 			float2 mean = s_mean[j];
 			float4 c = s_conic[j];
 
-			// c = (conic.xx, conic.xy, conic.yy, unused), already inverted in project_gaussians.
+			// c = (conic.xx, conic.xy, conic.yy, unused), already inverted in projection.py.
 			float dx = pixel.x - mean.x;
 			float dy = pixel.y - mean.y;
 			float mahalanobis = dx * (c.x * dx + c.y * dy) +
@@ -327,16 +261,12 @@ __global__ void render_gaussians(
 }
 
 torch::Tensor rasterize(
-	torch::Tensor means3D,
-	torch::Tensor scales,
-	torch::Tensor quaternions,
-	torch::Tensor opacities,
+	torch::Tensor means2D,
+	torch::Tensor depths,
+	torch::Tensor radii,
+	torch::Tensor conics,
 	torch::Tensor colors,
-	torch::Tensor world_to_cam_matrix,
-	float focal_x,
-	float focal_y,
-	float c_x,
-	float c_y,
+	torch::Tensor opacities,
 	int image_width,
 	int image_height
 ) {
@@ -344,25 +274,19 @@ torch::Tensor rasterize(
 		TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
 		TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 	};
-	check_input(means3D, "means3D");
-	check_input(scales, "scales");
-	check_input(quaternions, "quaternions");
-	check_input(opacities, "opacities");
+	check_input(means2D, "means2D");
+	check_input(depths, "depths");
+	check_input(radii, "radii");
+	check_input(conics, "conics");
 	check_input(colors, "colors");
-	check_input(world_to_cam_matrix, "world_to_cam_matrix");
+	check_input(opacities, "opacities");
 
-	const int num_gaussians = means3D.size(0);
+	const int num_gaussians = means2D.size(0);
 	const int num_tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 	const int num_tiles_y = (image_height + TILE_SIZE - 1) / TILE_SIZE;
 	const int num_tiles = num_tiles_x * num_tiles_y;
 
-	// These came from python and thus are torch::Tensor types
-	float* means3D_ptr = means3D.data_ptr<float>();
-	float* scales_ptr = scales.data_ptr<float>();
-	float* quaternions_ptr = quaternions.data_ptr<float>();
-	float* opacities_ptr = opacities.data_ptr<float>();
-	float* colors_ptr = colors.data_ptr<float>();
-	float* world_to_cam_matrix_ptr = world_to_cam_matrix.data_ptr<float>();
+	const float2* means2D_ptr = reinterpret_cast<const float2*>(means2D.data_ptr<float>());
 
 	auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 	auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
@@ -370,47 +294,36 @@ torch::Tensor rasterize(
 	auto u8  = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
 
 	torch::Tensor gaussian_data = torch::empty({num_gaussians, 4}, f32);  // xy=means2D, z=radius, w=depth
-	torch::Tensor means2D       = torch::empty({num_gaussians, 2}, f32);
 	torch::Tensor conic         = torch::empty({num_gaussians, 4}, f32);
 	torch::Tensor color_opacity = torch::empty({num_gaussians, 4}, f32);
 	torch::Tensor tiles_touched = torch::empty({num_gaussians}, i32);
 
 	float4* gaussian_data_ptr = reinterpret_cast<float4*>(gaussian_data.data_ptr<float>());
-	float2* means2D_ptr       = reinterpret_cast<float2*>(means2D.data_ptr<float>());
 	float4* conic_ptr         = reinterpret_cast<float4*>(conic.data_ptr<float>());
 	float4* color_opacity_ptr = reinterpret_cast<float4*>(color_opacity.data_ptr<float>());
 	int*    tiles_touched_ptr = tiles_touched.data_ptr<int>();
 
-	// Step 1: Project gaussians from 3D world space to 2D screen space
+	// Step 1: pack the projected gaussians and count the tiles each one touches.
 	const int threads = 256;
 	auto blocks_for = [threads](int n) { return (n + threads - 1) / threads; };
 
-	project_gaussians<<<blocks_for(num_gaussians), threads>>>(
+	prepare_gaussians<<<blocks_for(num_gaussians), threads>>>(
 		num_gaussians,
-		means3D_ptr,
-		scales_ptr,
-		quaternions_ptr,
-		opacities_ptr,
-		colors_ptr,
-		world_to_cam_matrix_ptr,
-		focal_x,
-		focal_y,
-		c_x,
-		c_y,
-		image_width,
-		image_height,
+		means2D_ptr,
+		depths.data_ptr<float>(),
+		radii.data_ptr<float>(),
+		conics.data_ptr<float>(),
+		colors.data_ptr<float>(),
+		opacities.data_ptr<float>(),
 		num_tiles_x,
 		num_tiles_y,
 		gaussian_data_ptr,
-		means2D_ptr,
 		conic_ptr,
 		color_opacity_ptr,
 		tiles_touched_ptr
 	);
-	check_cuda_error("project_gaussians");
+	check_cuda_error("prepare_gaussians");
 
-	// Step 2: bin gaussians into tiles, sorted by depth within each tile. Walkthrough of the
-	// offsets -> duplicate -> sort -> ranges pipeline: docs/rasterizer.md.
 	torch::Tensor offsets = torch::empty({num_gaussians}, i32);
 	int* offsets_ptr = offsets.data_ptr<int>();
 
@@ -442,7 +355,6 @@ torch::Tensor rasterize(
 	uint64_t* tiled_gaussian_keys   = reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>());
 	int*      tiled_gaussian_values = values.data_ptr<int>();
 
-	// How this kernel's parallelism was chosen: docs/rasterizer.md.
 	duplicate_gaussians<<<blocks_for(total_duplicates), threads>>>(
 		total_duplicates,
 		num_gaussians,

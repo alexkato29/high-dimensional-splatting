@@ -1,9 +1,10 @@
-import os
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
 from torch.utils.cpp_extension import load
+
+from gaussian_splatting.rasterizer.projection import project_gaussians  # noqa: F401
 
 _rasterizer_module: Optional[Any] = None
 
@@ -44,95 +45,62 @@ class RasterizeGaussians(torch.autograd.Function):
 	@staticmethod
 	def forward(
 		ctx,
-		means3D: torch.Tensor,
-		scales: torch.Tensor,
-		quaternions: torch.Tensor,
-		opacities: torch.Tensor,
+		means2D: torch.Tensor,
+		depths: torch.Tensor,
+		radii: torch.Tensor,
+		conics: torch.Tensor,
 		colors: torch.Tensor,
-		world_to_cam_matrix: torch.Tensor,
-		focal_x: float,
-		focal_y: float,
-		c_x: float,
-		c_y: float,
+		opacities: torch.Tensor,
 		image_width: int,
 		image_height: int
 	) -> torch.Tensor:
-		_C = _get_rasterizer()
-
-		output = _C.rasterize(
-			means3D.contiguous(),
-			scales.contiguous(),
-			quaternions.contiguous(),
-			opacities.contiguous(),
+		return _get_rasterizer().rasterize(
+			means2D.contiguous(),
+			depths.contiguous(),
+			radii.contiguous(),
+			conics.contiguous(),
 			colors.contiguous(),
-			world_to_cam_matrix.contiguous(),
-			float(focal_x),
-			float(focal_y),
-			float(c_x),
-			float(c_y),
+			opacities.contiguous(),
 			int(image_width),
 			int(image_height)
 		)
 
-		return output
-
 	@staticmethod
 	def backward(ctx, grad_output):
-		return None, None, None, None, None, None, None, None, None, None, None, None
+		return None, None, None, None, None, None, None, None
 
 
 def rasterize(
-	means3D: torch.Tensor,
-	scales: torch.Tensor,
-	quaternions: torch.Tensor,
-	opacities: torch.Tensor,
+	means2D: torch.Tensor,
+	depths: torch.Tensor,
+	radii: torch.Tensor,
+	conics: torch.Tensor,
 	colors: torch.Tensor,
-	world_to_cam_matrix: torch.Tensor,
-	focal_x: float,
-	focal_y: float,
-	c_x: float,
-	c_y: float,
+	opacities: torch.Tensor,
 	image_width: int,
 	image_height: int
 ) -> torch.Tensor:
 	"""
-	Rasterize 3D Gaussians to a 2D image.
+	Alpha-blend projected gaussians into an image, front to back, on 16x16 pixel tiles.
 
 	Args:
-		means3D: [N, 3] Gaussian centers in world space
-		scales: [N, 3] Gaussian scales (log space)
-		quaternions: [N, 4] Gaussian rotations as quaternions [w, x, y, z]
-		opacities: [N, 1] Gaussian opacities (0-1)
-		colors: [N, 3] Gaussian RGB colors (0-1)
-		world_to_cam_matrix: [4, 4] World-to-camera transformation matrix
-		focal_x: Focal length in pixels (x-axis)
-		focal_y: Focal length in pixels (y-axis)
-		c_x: Principal point x-coordinate
-		c_y: Principal point y-coordinate
-		image_width: Output image width
-		image_height: Output image height
+		means2D: [N, 2] centers in pixels
+		depths: [N] camera-space depths, used to sort
+		radii: [N] footprint radii in pixels, 0 for culled gaussians
+		conics: [N, 3] inverse 2D covariances as (xx, xy, yy)
+		colors: [N, 3] RGB
+		opacities: [N, 1] in (0, 1)
+		image_width, image_height: output size in pixels
+
+	The first four come from project_gaussians.
 
 	Returns:
-		[H, W, 3] Rendered image (RGB, 0-1 range)
+		[H, W, 3] rendered image
 	"""
-	assert means3D.ndim == 2 and means3D.shape[1] == 3
-	assert scales.shape == means3D.shape
-	assert quaternions.shape == (means3D.shape[0], 4)
-	assert opacities.shape == (means3D.shape[0], 1)
-	assert colors.shape == means3D.shape
-	assert world_to_cam_matrix.shape == (4, 4)
+	n = means2D.shape[0]
+	assert means2D.shape == (n, 2)
+	assert depths.shape == (n,) and radii.shape == (n,)
+	assert conics.shape == (n, 3) and colors.shape == (n, 3)
+	assert opacities.shape == (n, 1)
 
-	return RasterizeGaussians.apply(
-		means3D,
-		scales,
-		quaternions,
-		opacities,
-		colors,
-		world_to_cam_matrix,
-		focal_x,
-		focal_y,
-		c_x,
-		c_y,
-		image_width,
-		image_height
-	)
+	return RasterizeGaussians.apply(means2D, depths, radii, conics, colors, opacities, image_width, image_height)

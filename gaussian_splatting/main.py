@@ -8,27 +8,20 @@ import torch
 from PIL import Image
 
 from gaussian_splatting.config import TrainingParams
-from gaussian_splatting.rasterizer import rasterize
+from gaussian_splatting.rasterizer import project_gaussians, rasterize
 from gaussian_splatting.utils.dataset import Camera, ColmapDataset
 from gaussian_splatting.utils.gaussian import GaussianModel
 
 
 def render(camera: Camera, gaussians: GaussianModel) -> torch.Tensor:
-	rendered = rasterize(
-		means3D=gaussians.means,
-		scales=gaussians.scales,
-		quaternions=gaussians.quats,
-		opacities=gaussians.opacities,
-		colors=gaussians.colors(camera.center),
-		world_to_cam_matrix=camera.world_to_camera,
-		focal_x=camera.fx,
-		focal_y=camera.fy,
-		c_x=camera.cx,
-		c_y=camera.cy,
-		image_width=camera.width,
-		image_height=camera.height
+	means2D, depths, radii, conics = project_gaussians(
+		gaussians.means, gaussians.scales, gaussians.quats, camera.world_to_camera,
+		camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height
 	)
-	return rendered
+	return rasterize(
+		means2D, depths, radii, conics, gaussians.colors(camera.center), gaussians.opacities,
+		camera.width, camera.height
+	)
 
 
 def save_images(output_dir: Path, iteration: int, rendered: torch.Tensor, gt: torch.Tensor):
