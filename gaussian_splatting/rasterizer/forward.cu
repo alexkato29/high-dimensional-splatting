@@ -157,14 +157,8 @@ __device__ int find_gaussian_binary_search(
 	int num_gaussians,
 	int output_idx
 ) {
-	/*
-	The first N iterations of binary search check 2^(N-1) unique elements. That makes
-	this ridiculously cache friendly. The most frequent elements (like offsets[(num_gaussians - 1) / 2])
-	can stay on the L1 cache. The rest of offsets also fits comfortably on the L2 cache.
-
-	I had tried coercing the cache layout by using a coarse/fine binary search, but that
-	didn't have any impact. Seems like the hardware is already being very smart.
-	*/
+	// Cheap despite the scattered look: early probes hit the same few offsets across all threads, so
+	// they stay in L1/L2. See docs/rasterizer.md.
 	int left = 0;
 	int right = num_gaussians - 1;
 
@@ -189,25 +183,8 @@ __global__ void duplicate_gaussians(
 	uint64_t* tiled_gaussian_keys,
 	int* tiled_gaussian_values
 ) {
-	/*
-	This kernel initially had "flipped" parallelism and mapped threads to gaussian ids
-	rather than to output indices. That ate away at performance due to massive problems
-	with shuffled writes to global memory. Instead, mapping threads to output indices
-	ended up running substantially faster (~x5.5).
-
-	I also tried CSR. Basically, swap binary searches for writes to SMEM:
-	1. Find the min and max gaussian ID that the block works on
-	2. Make an array in smem of length blockDim.x (but must be known at compile time)
-	3. For every GID this block touches, replicate the GID in smem on all the indices
-	of output it is tied to
-	4. Lookup the output_idx in gaussian_indices[output_idx] rather than making a binary
-	search call
-
-	However, this approach was ultimately slower since the writes to smem ended up leading
-	to warp divergence. Also, gaussians have space in between them in the output (obviously,
-	that is what this kernel solves), so the smem writes weren't coalesced. Plus, caching is
-	so effective that the binary search baseline is already hard to beat.
-	*/
+	// One thread per output (duplicate) index, not per gaussian: ~5.5x faster, since writes stay
+	// coalesced. Alternatives tried and why they lost: docs/rasterizer.md.
 	int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (output_idx >= num_duplicates) return;
 
@@ -278,22 +255,8 @@ __global__ void render_gaussians(
 	int image_height,
 	float* output
 ) {
-	/*
-	Every thread in this block renders a pixel of the SAME tile, so every warp walks the same
-	gaussian list. Reading that list straight from global memory meant all 8 warps issued their
-	own loads for the same addresses. L1 served them (had a91% hit rate, DRAM idle at 13%) but
-	the L1/TEX unit itself saturated at ~82% doing 8x redundant request processing.
-
-	We stage a batch of gaussians into shared memory once per block, cooperatively, then let
-	every warp read from SMEM. Shared memory is the same physical SRAM as L1 but reached by a
-	different path (no tag lookup nor cache line handling) so it costs LSU slots (which had
-	~40% headroom) instead of L1/TEX throughput (which had none). All 32 threads in a warp read
-	the same SMEM address, which is a broadcast: one cycle, no bank conflicts.
-
-	The batch barrier also gives block-wide early termination for free. Previously a saturated
-	pixel broke its own loop but its block kept running until every pixel finished, now
-	__syncthreads_count lets the whole block bail once all 256 pixels are opaque.
-	*/
+	// All pixels in a block share one gaussian list, so each batch is staged through SMEM once per
+	// block instead of every warp re-requesting it from L1. See docs/rasterizer.md.
 	const int block_size = blockDim.x * blockDim.y;
 	int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
@@ -446,54 +409,8 @@ torch::Tensor rasterize(
 	);
 	check_cuda_error("project_gaussians");
 
-	/*
-	Step 2: Sort gaussians by depth per tile.
-
-	Ok, this part is a bit confusing so buckle up. To render a pixel, we need to know which gaussians influence it.
-	Duh. It also needs to be in depth order since we render front to back.
-
-	Naively: you globally sort all the gaussians by depth. Then your renderer, for each pixel, goes through all
-	gaussians front to back to compute their impact. That is painfully slow. 4k image res * 50k gaussians is
-	414 BILLION comparisons. I actually did that at first, and it took about 6 seconds to do one forward pass.
-
-	But, pixels should only check gaussians that actually matter (e.g., top left isn't checking a bottom right
-	gaussian). Then each pixel might only be checking tens of gaussians. Not tens of thousands. We do this by
-	tiling the image and, per tile, checking what gaussians actually overlap it. Great, that sounds faster. How
-	does it happen?
-
-	The end goal: have some list tiled_gaussian_ids_sorted that contains gaussiand ids like:
-	[tile0_depth0.1_gaussian123, tile0_depth1.5_gaussian456, ..., tileK_depth23.1_gaussian789]
-	sorted first by tile, then by depth. Only gaussians that touch the tile should be in the list. In this way,
-	we've basically created per tile gaussian lists. Then, we may have another list tiled_ranges such that
-	tiled_ranges[tile_idx] tells us the start and end index in tiled_gaussian_ids_sorted that we need to check.
-	If we can have these two things, then we can check only	relevant gaussians within each tile.
-
-	So how do we get those two lists? Like this (note that gaussian ID/GID just refers to the idx of the gaussian
-	in means2D and conic):
-	0. We know each gaussian touches tiles_touched[GID] and all times in a bounding box from tile_min[GID] to
-	tile_max[GID].
-
-	1. We compute a list offsets that is a prefix sum of tiles_touched. We also compute total_duplicates to be
-	the sum of tiles_touched (or more efficiently, offsets[-1] + tiles_touched[-1]).
-
-	2. We allocate keys and values lists of length total_duplicates that will store the key of a gaussian (see
-	the next step) and the value, which will be its GID.
-
-	3. We know which tiles each gaussian touches from tile_min and tile_max. We then can "duplicate" gaussians
-	by creating total_duplicates keys like (tile_idx | depth). Keys should be like:
-	[tile32_depth10.1, tile33_depth10.1, ...]
-	When writing to keys, we can use offsets[GID] to know which index to start writing to. We'll use depth[GID]
-	to know the depth, obviously. We also will store GID in the values list to map keys to gaussians.
-
-	4. Sort those lists by sorting keys first on tile ID, then on depth. We now have tiled_gaussian_keys_sorted
-	and tiled_gaussian_values_sorted.
-
-	5. Traverse the tiled_gaussian_keys_sorted and extract the tile IDs to build tiled_ranges.
-
-	Why tile at all and not just do it per pixel? We're already going to be making TONS of global memory calls.
-	By tiling, we can take advantage of SMEM to ideally make this operation less memory intensie. Sure, some
-	pixels will ignore some gaussians. But at least we have far fewer unique DRAM calls and DRAM requirements.
-	*/
+	// Step 2: bin gaussians into tiles, sorted by depth within each tile. Walkthrough of the
+	// offsets -> duplicate -> sort -> ranges pipeline: docs/rasterizer.md.
 	torch::Tensor offsets = torch::empty({num_gaussians}, i32);
 	int* offsets_ptr = offsets.data_ptr<int>();
 
@@ -525,7 +442,7 @@ torch::Tensor rasterize(
 	uint64_t* tiled_gaussian_keys   = reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>());
 	int*      tiled_gaussian_values = values.data_ptr<int>();
 
-	// Optimization of this kernel was super fun, see the kernel for info
+	// How this kernel's parallelism was chosen: docs/rasterizer.md.
 	duplicate_gaussians<<<blocks_for(total_duplicates), threads>>>(
 		total_duplicates,
 		num_gaussians,
