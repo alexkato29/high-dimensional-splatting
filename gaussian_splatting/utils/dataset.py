@@ -22,7 +22,11 @@ class Camera:
 
 	@property
 	def center(self) -> torch.Tensor:
-		"""Camera position in world space."""
+		"""Position of this camera in world space.
+
+		Returns:
+			[3] translation of the camera to world transform, used as the origin for view directions.
+		"""
 		return self.world_to_camera.inverse()[:3, 3]
 
 
@@ -40,14 +44,23 @@ class ColmapDataset:
 	1-1.6K range) and kept on the GPU. Every test_every-th image by name is held out, the same split
 	the 3DGS paper evaluates on, so our test PSNR is comparable to theirs.
 	"""
-	def __init__(self, data_path: str, max_width: int | None = 1600, test_every: int = 8, device: str = "cuda"):
+
+	def __init__(self, data_path: str, max_width: int | None = 1600, test_every: int = 8, device: str = "cuda") -> None:
+		"""Loads every camera and the sparse point cloud, leaving all of it resident on the GPU.
+
+		Args:
+			data_path: Scene root holding an images folder and a sparse/0 reconstruction.
+			max_width: Images wider than this are downscaled, or None to keep full resolution.
+			test_every: Every Nth image by name is held out for evaluation.
+			device: Device the images and camera poses are stored on.
+		"""
 		root = Path(data_path)
 		self.reconstruction = pycolmap.Reconstruction(str(root / "sparse" / "0"))
 
 		colmap_imgs = sorted(self.reconstruction.images.values(), key=lambda colmap_img: colmap_img.name)
 		cameras = [self._load_camera(colmap_img, root / "images", max_width, device) for colmap_img in colmap_imgs]
-		self.train_cameras: list[Camera] = [c for i, c in enumerate(cameras) if i % test_every != 0]
-		self.test_cameras: list[Camera] = [c for i, c in enumerate(cameras) if i % test_every == 0]
+		self.train_cameras = [c for i, c in enumerate(cameras) if i % test_every != 0]
+		self.test_cameras = [c for i, c in enumerate(cameras) if i % test_every == 0]
 
 		points = list(self.reconstruction.points3D.values())
 		self.point_cloud = PointCloud(
@@ -55,22 +68,32 @@ class ColmapDataset:
 			colors=np.array([p.color for p in points], dtype=np.float32) / 255.0,
 		)
 
-		# Radius of the training cameras around their centroid, padded 10%. Scales the
-		# position learning rate and densification thresholds to the scene's size.
 		centers = torch.stack([c.center for c in self.train_cameras])
 		self.extent: float = 1.1 * (centers - centers.mean(dim=0)).norm(dim=1).max().item()
 
 	def _load_camera(self, colmap_img: pycolmap.Image, images_dir: Path, max_width: int | None, device: str) -> Camera:
+		"""Decodes one image and rescales its COLMAP intrinsics to the size actually loaded.
+
+		Args:
+			colmap_img: COLMAP record naming the image file and its pose.
+			images_dir: Folder the image files live in.
+			max_width: Images wider than this are downscaled, or None to keep full resolution.
+			device: Device the image and pose are copied to.
+
+		Returns:
+			A Camera holding the pose, the rescaled intrinsics and the image as uint8 on the GPU.
+
+		Raises:
+			ValueError: If the camera model is not pinhole, or the file's aspect ratio disagrees
+				with its COLMAP camera by more than one percent.
+		"""
 		colmap_cam = self.reconstruction.cameras[colmap_img.camera_id]
 		# The rasterizer is a pure pinhole projection, so lens distortion must already be removed
 		# (colmap image_undistorter). Otherwise every pixel lands slightly in the wrong place.
 		if colmap_cam.model.name not in ("SIMPLE_PINHOLE", "PINHOLE"):
 			raise ValueError(f"{colmap_img.name}: camera model {colmap_cam.model.name} is unsupported, undistort the scene first")
 
-		# The image file, not COLMAP, decides the resolution. Datasets often ship images already
-		# downscaled from what SfM ran on. Only the aspect ratio has to agree, since intrinsics
-		# are rescaled to whatever we load. Downscaling keeps it to within rounding (well under 1%),
-		# while a rotated or cropped image changes it.
+		# COLMAP datasets often ship images already downscaled from what SfM ran on.
 		pil_img = Image.open(images_dir / colmap_img.name)
 		width, height = pil_img.size
 		camera_aspect_ratio = colmap_cam.width / colmap_cam.height
@@ -81,8 +104,6 @@ class ColmapDataset:
 			width, height = max_width, round(height * max_width / width)
 		sx, sy = width / colmap_cam.width, height / colmap_cam.height
 
-		# JPEGs can decode directly at 1/2, 1/4 or 1/8 scale in the DCT domain. Asking for the
-		# smallest one that is still >= the target skips most of the decode before the real resize.
 		pil_img.draft("RGB", (width, height))
 		pil_img = pil_img.convert("RGB").resize((width, height))
 
@@ -93,7 +114,6 @@ class ColmapDataset:
 			image_id=colmap_img.image_id,
 			name=colmap_img.name,
 			world_to_camera=world_to_camera.to(device),
-			# COLMAP and the rasterizer both put pixel centers at +0.5, so rescaling is a plain multiply.
 			fx=colmap_cam.focal_length_x * sx,
 			fy=colmap_cam.focal_length_y * sy,
 			cx=colmap_cam.principal_point_x * sx,

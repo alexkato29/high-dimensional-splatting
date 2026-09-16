@@ -10,11 +10,26 @@ C3 = (
 
 
 def num_sh_coeffs(degree: int) -> int:
+	"""Counts the spherical harmonic coefficients up to and including a degree.
+
+	Args:
+		degree: Highest spherical harmonic degree, from 0 to 3.
+
+	Returns:
+		The coefficient count, which is (degree + 1) squared.
+	"""
 	return (degree + 1) ** 2
 
 
 def sh_basis(dirs: torch.Tensor) -> torch.Tensor:
-	"""[N, 3] unit directions -> [N, 16] values of every basis function, degrees 0 through 3."""
+	"""Evaluates every spherical harmonic basis function for a set of directions.
+
+	Args:
+		dirs: [N, 3] unit direction vectors.
+
+	Returns:
+		[N, 16] value of each basis function of degrees 0 through 3.
+	"""
 	x, y, z = dirs.unbind(-1)
 	xx, yy, zz = x * x, y * y, z * z
 	xy, yz, xz = x * y, y * z, x * z
@@ -29,16 +44,31 @@ def sh_basis(dirs: torch.Tensor) -> torch.Tensor:
 
 
 def eval_sh(sh: torch.Tensor, dirs: torch.Tensor, degree: int) -> torch.Tensor:
-	"""
-	sh: [N, K, 3] learned weights. dirs: [N, 3] unit vectors from the camera to each gaussian.
-	Returns [N, 3] RGB using degrees 0..degree: per channel, a dot product of weights and basis values.
+	"""Turns learned spherical harmonic weights into an RGB color per gaussian.
+
+	Each channel is a dot product of the weights with the basis values for that gaussian's
+	viewing direction, so the color changes with where the camera is.
+
+	Args:
+		sh: [N, K, 3] learned weights ordered by increasing degree.
+		dirs: [N, 3] unit vectors from the camera to each gaussian.
+		degree: Highest degree to use, so every band above it is ignored.
+
+	Returns:
+		[N, 3] RGB, offset by 0.5 so all zero weights mean mid gray, clamped to non-negative.
 	"""
 	k = num_sh_coeffs(degree)
 	rgb = torch.einsum("nk,nkc->nc", sh_basis(dirs)[:, :k], sh[:, :k])
-	# The paper's convention is to +0.5 so all-zero weights mean mid-gray, clamped to non-negative.
 	return (rgb + 0.5).clamp_min(0.0)
 
 
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
-	"""The degree-0 weight that makes eval_sh return rgb from every direction."""
+	"""Inverts eval_sh at degree 0, which is how the model is initialized from point cloud colors.
+
+	Args:
+		rgb: [N, 3] colors in [0, 1].
+
+	Returns:
+		[N, 3] degree 0 weights that make eval_sh return rgb from every direction.
+	"""
 	return (rgb - 0.5) / C0

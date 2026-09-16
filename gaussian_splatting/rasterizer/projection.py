@@ -6,7 +6,14 @@ JACOBIAN_FOV_SCALE = 1.3
 
 
 def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:
-	"""[N, 4] unit quaternions (w, x, y, z) -> [N, 3, 3] rotation matrices."""
+	"""Converts rotation quaternions into rotation matrices.
+
+	Args:
+		quats: [N, 4] unit quaternions ordered (w, x, y, z).
+
+	Returns:
+		[N, 3, 3] rotation matrices.
+	"""
 	w, x, y, z = quats.unbind(-1)
 	return torch.stack([
 		1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
@@ -27,14 +34,31 @@ def project_gaussians(
 	width: int,
 	height: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""
-	means [N, 3], scales [N, 3], quats [N, 4] unit (w, x, y, z), world_to_camera [4, 4].
+	"""Projects 3D gaussians into the image plane as 2D gaussians.
+
+	Each gaussian's 3D covariance is built from its scale and rotation, pushed through the
+	perspective projection's local linear approximation, and blurred slightly so that a gaussian
+	thinner than a pixel still covers one. Autograd differentiates all of it, which is why this
+	stays in torch rather than CUDA.
+
+	Args:
+		means: [N, 3] gaussian centers in world space.
+		scales: [N, 3] per axis standard deviations, already activated.
+		quats: [N, 4] unit quaternions ordered (w, x, y, z).
+		world_to_camera: [4, 4] world to camera transform.
+		fx: Horizontal focal length in pixels.
+		fy: Vertical focal length in pixels.
+		cx: Horizontal principal point in pixels.
+		cy: Vertical principal point in pixels.
+		width: Image width in pixels.
+		height: Image height in pixels.
 
 	Returns:
-		means2D [N, 2]: centers in pixels.
-		depths [N]: camera-space z, used only to sort.
-		radii [N]: footprint radius in pixels, 0 for culled gaussians. Not differentiable.
-		conics [N, 3]: inverse 2D covariance as (xx, xy, yy).
+		A tuple of four tensors.
+			means2D: [N, 2] centers in pixels.
+			depths: [N] camera space z, used only to sort.
+			radii: [N] footprint radius in pixels, 0 for culled gaussians and not differentiable.
+			conics: [N, 3] inverse 2D covariance as (xx, xy, yy).
 	"""
 	# torch.compile's inductor knows that, more often than not, cuBLAS is faster than any generated
 	# kernel. So, it defaults to calling it. However, cuBLAS is rather slow for our 3x3 GEMMs due

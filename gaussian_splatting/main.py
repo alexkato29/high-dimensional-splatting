@@ -15,10 +15,25 @@ from gaussian_splatting.utils.loss import l1_loss, psnr, ssim
 
 
 def render(camera: Camera, gaussians: GaussianModel) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Renders one view, projecting in torch and blending in CUDA.
+
+	Args:
+		camera: View to render, holding the pose, intrinsics and output size.
+		gaussians: Model supplying the geometry, the opacities and the view dependent colors.
+
+	Returns:
+		A tuple of three tensors.
+			image: [H, W, 3] rendered image.
+			means2D: [N, 2] projected centers, whose gradient drives densification and which
+				therefore retains its grad.
+			radii: [N] footprint radii in pixels, 0 for gaussians this view culled.
+	"""
 	means2D, depths, radii, conics = project_gaussians(
 		gaussians.means, gaussians.scales, gaussians.quats, camera.world_to_camera,
 		camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height
 	)
+	# Since means2D is not a named parameter in the optimization parameters, its gradient is freed
+	# after use unless we explicitly call retain_grad(). We need it for densification.
 	if means2D.requires_grad:
 		means2D.retain_grad()
 	image = rasterize(
@@ -29,20 +44,45 @@ def render(camera: Camera, gaussians: GaussianModel) -> tuple[torch.Tensor, torc
 
 
 def position_lr(params: TrainingParams, extent: float, iteration: int) -> float:
-	"""Exponential decay from init to final over training, both scaled by the scene size."""
+	"""Exponentially decaying learning rate for the gaussian centers.
+
+	Args:
+		params: Training constants holding the initial and final rates and the horizon.
+		extent: Radius of the scene, which puts the rate into the scene's own units.
+		iteration: Current iteration, counted from 1.
+
+	Returns:
+		The learning rate for this iteration, interpolated in log space and held flat past the end.
+	"""
 	t = min(iteration / params.iterations, 1.0)
 	return (params.position_lr_init * extent) ** (1 - t) * (params.position_lr_final * extent) ** t
 
 
 @torch.no_grad()
 def evaluate(dataset: ColmapDataset, model: GaussianModel) -> float:
-	"""Mean PSNR over the held out cameras."""
+	"""Renders every held out view and scores it.
+
+	Args:
+		dataset: Scene whose test cameras are rendered.
+		model: Gaussians to render.
+
+	Returns:
+		Mean PSNR in decibels over the held out cameras.
+	"""
 	scores = [psnr(render(camera, model)[0], camera.image.float() / 255.0)
 			  for camera in dataset.test_cameras]
 	return torch.stack(scores).mean().item()
 
 
 def save_checkpoint(output_dir: Path, model: GaussianModel, iteration: int, test_psnr: float) -> None:
+	"""Writes the parameters and the state needed to render them again later.
+
+	Args:
+		output_dir: Folder the checkpoint is written into, overwriting any previous one.
+		model: Gaussians to save.
+		iteration: Iteration the checkpoint was taken at.
+		test_psnr: Held out PSNR the checkpoint scored.
+	"""
 	torch.save(
 		{
 			"params": {name: p.detach().cpu() for name, p in model.params.items()},
@@ -55,11 +95,24 @@ def save_checkpoint(output_dir: Path, model: GaussianModel, iteration: int, test
 
 
 def save_comparison(output_dir: Path, iteration: int, rendered: torch.Tensor, gt: torch.Tensor) -> None:
+	"""Writes the render beside its ground truth as one image.
+
+	Args:
+		output_dir: Folder the image is written into.
+		iteration: Iteration used to name the file.
+		rendered: [H, W, 3] rendered image in [0, 1].
+		gt: [H, W, 3] ground truth image in [0, 1].
+	"""
 	images = [(t.detach().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8) for t in (rendered, gt)]
 	Image.fromarray(np.concatenate(images, axis=1)).save(output_dir / f"iter_{iteration:06d}.png")
 
 
 def parse_args() -> argparse.Namespace:
+	"""Reads the command line.
+
+	Returns:
+		The parsed arguments, with every flag defaulted to the paper's setting.
+	"""
 	parser = argparse.ArgumentParser(description="Train 3D gaussian splats on a COLMAP scene")
 	defaults = TrainingParams()
 	parser.add_argument("data_path", help="COLMAP scene laid out as <path>/images and <path>/sparse/0")
@@ -73,6 +126,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def train(args: argparse.Namespace) -> None:
+	"""Runs the whole training loop, from loading the scene to the last checkpoint.
+
+	Each iteration renders one training view, scores it with L1 and D-SSIM, and steps Adam. Every
+	hundredth iteration between densify_from_iter and densify_until_iter also clones, splits and
+	prunes gaussians, and every opacity_reset_interval knocks all the opacities down.
+
+	Args:
+		args: Parsed command line, naming the scene and overriding the defaults.
+	"""
 	if args.seed is not None:
 		random.seed(args.seed)
 		torch.manual_seed(args.seed)
@@ -96,13 +158,13 @@ def train(args: argparse.Namespace) -> None:
 
 	epoch: list[Camera] = []
 	times: list[float] = []
-	best_psnr: float = float("-inf")
+	best_psnr = float("-inf")
 	for iteration in range(1, params.iterations + 1):
-		start: float = time.time()
+		start = time.time()
 
 		if not epoch:
 			epoch = random.sample(dataset.train_cameras, len(dataset.train_cameras))
-		camera: Camera = epoch.pop()
+		camera = epoch.pop()
 
 		for group in optimizer.param_groups:
 			if group["name"] == "means":

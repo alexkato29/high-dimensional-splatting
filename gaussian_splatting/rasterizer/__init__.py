@@ -10,14 +10,19 @@ _rasterizer_module: Any | None = None
 
 
 def _get_rasterizer() -> Any:
+	"""Compiles the CUDA extension on first use and caches the loaded module.
+
+	Returns:
+		The imported extension module exposing rasterize and rasterize_backward.
+	"""
 	global _rasterizer_module
 
 	if _rasterizer_module is not None:
 		return _rasterizer_module
 
-	current_dir: Path = Path(__file__).parent
+	current_dir = Path(__file__).parent
 
-	sources: list[str] = [
+	sources = [
 		str(current_dir / "forward.cu"),
 		str(current_dir / "backward.cu"),
 		str(current_dir / "bindings.cpp")
@@ -43,6 +48,8 @@ def _get_rasterizer() -> Any:
 
 
 class RasterizeGaussians(torch.autograd.Function):
+	"""Autograd node wrapping the CUDA tile binning and alpha blend."""
+
 	@staticmethod
 	def forward(
 		ctx,
@@ -56,6 +63,23 @@ class RasterizeGaussians(torch.autograd.Function):
 		image_width: int,
 		image_height: int
 	) -> torch.Tensor:
+		"""Renders the image and saves what the backward pass needs to replay the blend.
+
+		Args:
+			ctx: Autograd context the saved tensors are stashed on.
+			means2D: [N, 2] centers in pixels.
+			depths: [N] camera space depths, used to sort.
+			radii: [N] footprint radii in pixels, 0 for culled gaussians.
+			conics: [N, 3] inverse 2D covariances as (xx, xy, yy).
+			colors: [N, 3] RGB.
+			opacities: [N, 1] in (0, 1).
+			background: [3] RGB shown wherever the gaussians do not cover.
+			image_width: Output width in pixels.
+			image_height: Output height in pixels.
+
+		Returns:
+			[H, W, 3] rendered image.
+		"""
 		image, final_transmittance, n_contrib, values_sorted, tile_ranges, conic, color_opacity = (
 			_get_rasterizer().rasterize(
 				means2D.contiguous(),
@@ -75,7 +99,17 @@ class RasterizeGaussians(torch.autograd.Function):
 		return image
 
 	@staticmethod
-	def backward(ctx, grad_image):
+	def backward(ctx, grad_image: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+		"""Walks each pixel's gaussian list back to front to recover the per gaussian gradients.
+
+		Args:
+			ctx: Autograd context holding the tensors saved during the forward pass.
+			grad_image: [H, W, 3] gradient of the loss with respect to the rendered image.
+
+		Returns:
+			One gradient per forward argument, and None for the arguments that are not
+			differentiable, namely depths, radii, background and the image size.
+		"""
 		(means2D, conic, color_opacity, values_sorted, tile_ranges,
 		 final_transmittance, n_contrib, background) = ctx.saved_tensors
 		width, height = ctx.image_size
@@ -106,23 +140,23 @@ def rasterize(
 	image_height: int,
 	background: torch.Tensor | None = None
 ) -> torch.Tensor:
-	"""
-	Alpha-blend projected gaussians into an image, front to back, on 16x16 pixel tiles.
+	"""Alpha blends projected gaussians into an image, front to back, on 16x16 pixel tiles.
+
+	The first four arguments come from project_gaussians.
 
 	Args:
-		means2D: [N, 2] centers in pixels
-		depths: [N] camera-space depths, used to sort
-		radii: [N] footprint radii in pixels, 0 for culled gaussians
-		conics: [N, 3] inverse 2D covariances as (xx, xy, yy)
-		colors: [N, 3] RGB
-		opacities: [N, 1] in (0, 1)
-		image_width, image_height: output size in pixels
-		background: [3] RGB shown wherever the gaussians do not cover, black by default
-
-	The first four come from project_gaussians.
+		means2D: [N, 2] centers in pixels.
+		depths: [N] camera space depths, used to sort.
+		radii: [N] footprint radii in pixels, 0 for culled gaussians.
+		conics: [N, 3] inverse 2D covariances as (xx, xy, yy).
+		colors: [N, 3] RGB.
+		opacities: [N, 1] in (0, 1).
+		image_width: Output width in pixels.
+		image_height: Output height in pixels.
+		background: [3] RGB shown wherever the gaussians do not cover, black by default.
 
 	Returns:
-		[H, W, 3] rendered image
+		[H, W, 3] rendered image.
 	"""
 	n = means2D.shape[0]
 	assert means2D.shape == (n, 2)
