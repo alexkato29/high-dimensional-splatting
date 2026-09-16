@@ -42,6 +42,18 @@ def evaluate(dataset: ColmapDataset, model: GaussianModel) -> float:
 	return torch.stack(scores).mean().item()
 
 
+def save_checkpoint(output_dir: Path, model: GaussianModel, iteration: int, test_psnr: float) -> None:
+	torch.save(
+		{
+			"params": {name: p.detach().cpu() for name, p in model.params.items()},
+			"active_sh_degree": model.active_sh_degree,
+			"iteration": iteration,
+			"test_psnr": test_psnr,
+		},
+		output_dir / "model.pt",
+	)
+
+
 def save_comparison(output_dir: Path, iteration: int, rendered: torch.Tensor, gt: torch.Tensor) -> None:
 	images = [(t.detach().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8) for t in (rendered, gt)]
 	Image.fromarray(np.concatenate(images, axis=1)).save(output_dir / f"iter_{iteration:06d}.png")
@@ -65,6 +77,7 @@ def train(data_path: str) -> None:
 
 	epoch: list[Camera] = []
 	times: list[float] = []
+	best_psnr: float = float("-inf")
 	for iteration in range(1, params.iterations + 1):
 		start: float = time.time()
 
@@ -105,11 +118,14 @@ def train(data_path: str) -> None:
 				  f"Gaussians: {model.means.shape[0]}, Avg. Time: {np.mean(times) * 1000:.1f}ms")
 			times = []
 		if iteration % params.eval_interval == 0 or iteration == params.iterations:
-			print(f"Iteration {iteration}: test PSNR {evaluate(dataset, model):.2f} dB")
+			test_psnr = evaluate(dataset, model)
+			print(f"Iteration {iteration}: test PSNR {test_psnr:.2f} dB")
 			save_comparison(output_dir, iteration, rendered_image, gt_image)
+			if test_psnr > best_psnr:
+				best_psnr = test_psnr
+				save_checkpoint(output_dir, model, iteration, test_psnr)
 
-	torch.save({name: p.detach().cpu() for name, p in model.params.items()}, output_dir / "model.pt")
-	print(f"Training completed. Output in {output_dir}")
+	print(f"Training completed, best test PSNR {best_psnr:.2f} dB. Output in {output_dir}")
 
 
 if __name__ == "__main__":
