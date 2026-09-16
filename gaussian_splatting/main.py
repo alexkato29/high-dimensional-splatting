@@ -1,5 +1,5 @@
+import argparse
 import random
-import sys
 import time
 from pathlib import Path
 
@@ -59,18 +59,37 @@ def save_comparison(output_dir: Path, iteration: int, rendered: torch.Tensor, gt
 	Image.fromarray(np.concatenate(images, axis=1)).save(output_dir / f"iter_{iteration:06d}.png")
 
 
-def train(data_path: str) -> None:
-	print(f"Loading dataset from {data_path}")
-	dataset: ColmapDataset = ColmapDataset(data_path)
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="Train 3D gaussian splats on a COLMAP scene")
+	defaults = TrainingParams()
+	parser.add_argument("data_path", help="COLMAP scene laid out as <path>/images and <path>/sparse/0")
+	parser.add_argument("--iterations", type=int, default=defaults.iterations)
+	parser.add_argument("--eval-interval", type=int, default=defaults.eval_interval)
+	parser.add_argument("--max-width", type=int, default=1600, help="downscale images wider than this")
+	parser.add_argument("--test-every", type=int, default=8, help="hold out every Nth image")
+	parser.add_argument("--output", type=Path, default=None, help="defaults to outputs/training_<timestamp>")
+	parser.add_argument("--seed", type=int, default=None)
+	return parser.parse_args()
+
+
+def train(args: argparse.Namespace) -> None:
+	if args.seed is not None:
+		random.seed(args.seed)
+		torch.manual_seed(args.seed)
+
+	print(f"Loading dataset from {args.data_path}")
+	dataset = ColmapDataset(args.data_path, max_width=args.max_width, test_every=args.test_every)
 	print(f"Loaded {len(dataset.train_cameras)} train / {len(dataset.test_cameras)} test images and {len(dataset.point_cloud.points)} points")
 
-	model: GaussianModel = GaussianModel(dataset.point_cloud)
+	model = GaussianModel(dataset.point_cloud)
 	print(f"Initialized {model.means.shape[0]} Gaussians, scene extent {dataset.extent:.2f}")
 
-	params: TrainingParams = TrainingParams()
+	params = TrainingParams()
+	params.iterations = args.iterations
+	params.eval_interval = args.eval_interval
 	optimizer = torch.optim.Adam(model.get_optimizer_params(params, dataset.extent), eps=1e-15)
 
-	output_dir: Path = Path("outputs") / f"training_{int(time.time())}"
+	output_dir = args.output or Path("outputs") / f"training_{int(time.time())}"
 	output_dir.mkdir(parents=True, exist_ok=True)
 	print(f"Saving to {output_dir}")
 	print(f"Starting training for {params.iterations} iterations...")
@@ -91,10 +110,10 @@ def train(data_path: str) -> None:
 		if iteration % params.sh_degree_interval == 0:
 			model.active_sh_degree = min(model.active_sh_degree + 1, model.max_sh_degree)
 
-		gt_image: torch.Tensor = camera.image.float() / 255.0
+		gt_image = camera.image.float() / 255.0
 		rendered_image, means2D, radii = render(camera, model)
 
-		loss: torch.Tensor = (
+		loss = (
 			(1 - params.lambda_dssim) * l1_loss(rendered_image, gt_image)
 			+ params.lambda_dssim * (1 - ssim(rendered_image, gt_image))
 		)
@@ -129,6 +148,4 @@ def train(data_path: str) -> None:
 
 
 if __name__ == "__main__":
-	if len(sys.argv) < 2:
-		raise ValueError("Missing arguments. Usage: python main.py <path to colmap scene>")
-	train(sys.argv[1])
+	train(parse_args())
