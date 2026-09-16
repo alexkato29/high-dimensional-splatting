@@ -1,0 +1,7 @@
+{
+  "languages": {
+    "C++": {
+      "language_servers": ["!clangd"]
+    }
+  }
+}

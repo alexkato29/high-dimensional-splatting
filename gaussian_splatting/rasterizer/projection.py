@@ -2,7 +2,7 @@ import torch
 
 NEAR_PLANE = 0.2
 LOW_PASS = 0.3
-CENTER_MARGIN = 100.0
+JACOBIAN_FOV_SCALE = 1.3
 
 
 def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:
@@ -50,10 +50,14 @@ def project_gaussians(
 	cov3D = M @ M.transpose(1, 2)
 
 	z_inv = 1 / (z + 1e-6)
+	limit_x = JACOBIAN_FOV_SCALE * (0.5 * width / fx)
+	limit_y = JACOBIAN_FOV_SCALE * (0.5 * height / fy)
+	jx = (x * z_inv).clamp(-limit_x, limit_x) * z
+	jy = (y * z_inv).clamp(-limit_y, limit_y) * z
 	zeros = torch.zeros_like(z)
 	J = torch.stack([
-		fx * z_inv, zeros, -fx * x * z_inv * z_inv,
-		zeros, fy * z_inv, -fy * y * z_inv * z_inv,
+		fx * z_inv, zeros, -fx * jx * z_inv * z_inv,
+		zeros, fy * z_inv, -fy * jy * z_inv * z_inv,
 	], dim=-1).reshape(-1, 2, 3)
 	JW = J @ R
 	cov2D = JW @ cov3D @ JW.transpose(1, 2)
@@ -70,8 +74,6 @@ def project_gaussians(
 		u, v = means2D.unbind(-1)
 		visible = (
 			(depths > NEAR_PLANE)
-			& (u >= -CENTER_MARGIN) & (u < width + CENTER_MARGIN)
-			& (v >= -CENTER_MARGIN) & (v < height + CENTER_MARGIN)
 			& (u - radii <= width) & (u + radii >= 0) & (v - radii <= height) & (v + radii >= 0)
 			& (det > 0)
 		)

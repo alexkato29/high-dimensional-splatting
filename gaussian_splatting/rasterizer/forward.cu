@@ -6,40 +6,8 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sequence.h>
 #include <cub/device/device_radix_sort.cuh>
+#include "common.cuh"
 
-
-// Tile size in pixels. Compile-time so that RENDER_BATCH is derived from it rather than duplicated.
-// Also, the compiler can optimize pixel_to_tile's integer divisions  into shifts (GPUs have no integer
-// divide instruction, so dividing by a runtime value costs ~15-20 instructions, always avoid).
-#define TILE_SIZE 16
-
-// Number of gaussians loaded into SMEM per render batch. It must be equal to the block
-// size since each block cooperatively loads gaussians into SMEM.
-#define RENDER_BATCH (TILE_SIZE * TILE_SIZE)
-
-
-__device__ inline int2 pixel_to_tile(float2 pixel) {
-	return make_int2(static_cast<int>(pixel.x) / TILE_SIZE, static_cast<int>(pixel.y) / TILE_SIZE);
-}
-
-inline void check_cuda_error(const char* kernel_name) {
-	cudaError_t err = cudaGetLastError();
-	if (err != cudaSuccess) {
-		throw std::runtime_error(
-			std::string("CUDA kernel launch error (") + kernel_name + "): " +
-			cudaGetErrorString(err)
-		);
-	}
-
-	cudaDeviceSynchronize();
-	err = cudaGetLastError();
-	if (err != cudaSuccess) {
-		throw std::runtime_error(
-			std::string("CUDA kernel execution error (") + kernel_name + "): " +
-			cudaGetErrorString(err)
-		);
-	}
-}
 
 __global__ void prepare_gaussians(
 	int num_gaussians,
@@ -187,9 +155,12 @@ __global__ void render_gaussians(
 	const float2* means2D,
 	const float4* conic,
 	const float4* color_opacity,
+	const float* background,
 	int image_width,
 	int image_height,
-	float* output
+	float* output,
+	float* final_transmittance,
+	int* n_contrib
 ) {
 	const int block_size = blockDim.x * blockDim.y;
 	int tid = threadIdx.y * blockDim.x + threadIdx.x;
@@ -215,6 +186,9 @@ __global__ void render_gaussians(
 	float transmittance = 1.0f;
 	bool done = !inside;
 
+	int contributor = 0;
+	int last_contributor = 0;
+
 	for (int batch_start = 0; batch_start < num_todo; batch_start += block_size) {
 		// Doubles as the barrier protecting last iteration's SMEM reads from this iteration's writes.
 		if (__syncthreads_count(done) == block_size) break;
@@ -230,6 +204,7 @@ __global__ void render_gaussians(
 
 		int batch_count = min(block_size, num_todo - batch_start);
 		for (int j = 0; j < batch_count && !done; j++) {
+			contributor++;
 			float2 mean = s_mean[j];
 			float4 c = s_conic[j];
 
@@ -241,32 +216,45 @@ __global__ void render_gaussians(
 			float weight = __expf(-0.5f * mahalanobis);
 
 			float4 color = s_color[j];
-			float alpha = color.w * weight;
+			float alpha = fminf(MAX_ALPHA, color.w * weight);
 
-			if (alpha < 1e-4f) continue;
+			if (alpha < MIN_ALPHA) continue;
+
+			float test_transmittance = transmittance * (1.0f - alpha);
+			if (test_transmittance < MIN_TRANSMITTANCE) {
+				done = true;
+				continue;
+			}
 
 			accumulated_color.x += alpha * transmittance * color.x;
 			accumulated_color.y += alpha * transmittance * color.y;
 			accumulated_color.z += alpha * transmittance * color.z;
 
-			transmittance *= (1.0f - alpha);
-
-			if (transmittance < 1e-3f) done = true;
+			transmittance = test_transmittance;
+			last_contributor = contributor;
 		}
 	}
 
 	if (inside) {
-		((float4*)output)[py * image_width + px] = accumulated_color;
+		int pixel_idx = py * image_width + px;
+		((float4*)output)[pixel_idx] = make_float4(
+			accumulated_color.x + transmittance * background[0],
+			accumulated_color.y + transmittance * background[1],
+			accumulated_color.z + transmittance * background[2],
+			0.0f);
+		final_transmittance[pixel_idx] = transmittance;
+		n_contrib[pixel_idx] = last_contributor;
 	}
 }
 
-torch::Tensor rasterize(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize(
 	torch::Tensor means2D,
 	torch::Tensor depths,
 	torch::Tensor radii,
 	torch::Tensor conics,
 	torch::Tensor colors,
 	torch::Tensor opacities,
+	torch::Tensor background,
 	int image_width,
 	int image_height
 ) {
@@ -280,6 +268,7 @@ torch::Tensor rasterize(
 	check_input(conics, "conics");
 	check_input(colors, "colors");
 	check_input(opacities, "opacities");
+	check_input(background, "background");
 
 	const int num_gaussians = means2D.size(0);
 	const int num_tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
@@ -344,7 +333,13 @@ torch::Tensor rasterize(
 	int total_duplicates = last_offset + last_tiles_touched;
 
 	if (total_duplicates == 0) {
-		return torch::zeros({image_height, image_width, 3}, f32);
+		return {background.reshape({1, 1, 3}).expand({image_height, image_width, 3}).contiguous(),
+				torch::ones({image_height, image_width}, f32),
+				torch::zeros({image_height, image_width}, i32),
+				torch::empty({0}, i32),
+				torch::zeros({num_tiles, 2}, i32),
+				conic,
+				color_opacity};
 	}
 
 
@@ -419,6 +414,8 @@ torch::Tensor rasterize(
 	// Step 3: alpha blend/render the gaussians
 	// We use a 4th channel to allow vectorized writes, but we don't actually care about it.
 	torch::Tensor output = torch::empty({image_height, image_width, 4}, f32);
+	torch::Tensor final_transmittance = torch::empty({image_height, image_width}, f32);
+	torch::Tensor n_contrib = torch::empty({image_height, image_width}, i32);
 
 	float* output_ptr = output.data_ptr<float>();
 
@@ -431,12 +428,16 @@ torch::Tensor rasterize(
 		means2D_ptr,
 		conic_ptr,
 		color_opacity_ptr,
+		background.data_ptr<float>(),
 		image_width,
 		image_height,
-		output_ptr
+		output_ptr,
+		final_transmittance.data_ptr<float>(),
+		n_contrib.data_ptr<int>()
 	);
 	check_cuda_error("render_gaussians");
 
 	// Drop the useless 4th channel here, torch can do this for free functionally
-	return output.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
+	torch::Tensor image = output.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
+	return {image, final_transmittance, n_contrib, values_sorted, tile_ranges_t, conic, color_opacity};
 }

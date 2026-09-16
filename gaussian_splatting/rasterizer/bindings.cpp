@@ -1,12 +1,27 @@
 #include <torch/extension.h>
 
-torch::Tensor rasterize(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize(
 	torch::Tensor means2D,
 	torch::Tensor depths,
 	torch::Tensor radii,
 	torch::Tensor conics,
 	torch::Tensor colors,
 	torch::Tensor opacities,
+	torch::Tensor background,
+	int image_width,
+	int image_height
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_backward(
+	torch::Tensor grad_image,
+	torch::Tensor means2D,
+	torch::Tensor conic,
+	torch::Tensor color_opacity,
+	torch::Tensor values_sorted,
+	torch::Tensor tile_ranges,
+	torch::Tensor final_transmittance,
+	torch::Tensor n_contrib,
+	torch::Tensor background,
 	int image_width,
 	int image_height
 );
@@ -19,6 +34,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("conics"),
 		py::arg("colors"),
 		py::arg("opacities"),
+		py::arg("background"),
+		py::arg("image_width"),
+		py::arg("image_height")
+	);
+	m.def("rasterize_backward", &rasterize_backward, "Gaussian Splatting Rasterizer backward (CUDA)",
+		py::arg("grad_image"),
+		py::arg("means2D"),
+		py::arg("conic"),
+		py::arg("color_opacity"),
+		py::arg("values_sorted"),
+		py::arg("tile_ranges"),
+		py::arg("final_transmittance"),
+		py::arg("n_contrib"),
+		py::arg("background"),
 		py::arg("image_width"),
 		py::arg("image_height")
 	);
