@@ -25,6 +25,7 @@ def _get_rasterizer() -> Any:
 	sources = [
 		str(current_dir / "forward.cu"),
 		str(current_dir / "backward.cu"),
+		str(current_dir / "sh.cu"),
 		str(current_dir / "bindings.cpp")
 	]
 

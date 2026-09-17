@@ -26,6 +26,21 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 	int image_height
 );
 
+torch::Tensor eval_sh(
+	torch::Tensor sh_dc,
+	torch::Tensor sh_rest,
+	torch::Tensor dirs,
+	int degree
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> eval_sh_backward_host(
+	torch::Tensor grad_rgb,
+	torch::Tensor sh_dc,
+	torch::Tensor sh_rest,
+	torch::Tensor dirs,
+	int degree
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("rasterize", &rasterize, "Gaussian Splatting Rasterizer (CUDA)",
 		py::arg("means2D"),
@@ -50,5 +65,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("background"),
 		py::arg("image_width"),
 		py::arg("image_height")
+	);
+	m.def("eval_sh", &eval_sh, "Spherical harmonics colors (CUDA)",
+		py::arg("sh_dc"),
+		py::arg("sh_rest"),
+		py::arg("dirs"),
+		py::arg("degree")
+	);
+	m.def("eval_sh_backward", &eval_sh_backward_host, "Spherical harmonics colors backward (CUDA)",
+		py::arg("grad_rgb"),
+		py::arg("sh_dc"),
+		py::arg("sh_rest"),
+		py::arg("dirs"),
+		py::arg("degree")
 	);
 }

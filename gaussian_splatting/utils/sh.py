@@ -1,5 +1,7 @@
 import torch
 
+from gaussian_splatting.rasterizer import _get_rasterizer
+
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
 C2 = (1.0925484305920792, -1.0925484305920792, 0.31539156525252005, -1.0925484305920792, 0.5462742152960396)
@@ -21,13 +23,50 @@ def num_sh_coeffs(degree: int) -> int:
 	return (degree + 1) ** 2
 
 
-@torch.compile(dynamic=True)
+class EvalSH(torch.autograd.Function):
+	"""Autograd node wrapping the CUDA spherical harmonics kernels."""
+
+	@staticmethod
+	def forward(ctx, sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degree: int) -> torch.Tensor:
+		"""Evaluates the colors and saves the inputs the backward needs.
+
+		Args:
+			ctx: Autograd context the saved tensors are stashed on.
+			sh_dc: [N, 1, 3] degree 0 weights, contiguous.
+			sh_rest: [N, 15, 3] weights for degrees 1 through 3, contiguous.
+			dirs: [N, 3] unit vectors from the camera to each gaussian, contiguous.
+			degree: Highest degree to evaluate.
+
+		Returns:
+			[N, 3] RGB.
+		"""
+		ctx.save_for_backward(sh_dc, sh_rest, dirs)
+		ctx.degree = degree
+		return _get_rasterizer().eval_sh(sh_dc, sh_rest, dirs, degree)
+
+	@staticmethod
+	def backward(ctx, grad_rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+		"""Recomputes the basis and scatters the gradients back to the weights and the directions.
+
+		Args:
+			ctx: Autograd context holding the saved inputs.
+			grad_rgb: [N, 3] gradient of the loss with respect to the colors.
+
+		Returns:
+			Gradients for sh_dc, sh_rest and dirs, and None for the degree.
+		"""
+		sh_dc, sh_rest, dirs = ctx.saved_tensors
+		grad_dc, grad_rest, grad_dirs = _get_rasterizer().eval_sh_backward(
+			grad_rgb.contiguous(), sh_dc, sh_rest, dirs, ctx.degree
+		)
+		return grad_dc, grad_rest, grad_dirs, None
+
+
 def eval_sh(sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degree: int) -> torch.Tensor:
 	"""Turns learned spherical harmonic weights into an RGB color per gaussian.
 
-	Each channel is a weighted sum of the basis functions evaluated at that gaussian's viewing
-	direction, so the color changes with where the camera is. The sum is written out term by term,
-	with every operation pointwise, so torch.compile can fuse it into a single kernel.
+	One CUDA thread per gaussian evaluates the basis functions for its viewing direction and mixes
+	the weights, so no basis or coefficient tensor is ever materialized.
 
 	Args:
 		sh_dc: [N, 1, 3] degree 0 weights.
@@ -38,33 +77,7 @@ def eval_sh(sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degr
 	Returns:
 		[N, 3] RGB, offset by 0.5 so all zero weights mean mid gray, clamped to non-negative.
 	"""
-	rgb = C0 * sh_dc[:, 0] + 0.5
-	if degree > 0:
-		x, y, z = dirs[:, 0:1], dirs[:, 1:2], dirs[:, 2:3]
-		rgb = rgb - C1 * y * sh_rest[:, 0] + C1 * z * sh_rest[:, 1] - C1 * x * sh_rest[:, 2]
-		if degree > 1:
-			xx, yy, zz = x * x, y * y, z * z
-			xy, yz, xz = x * y, y * z, x * z
-			rgb = (
-				rgb
-				+ C2[0] * xy * sh_rest[:, 3]
-				+ C2[1] * yz * sh_rest[:, 4]
-				+ C2[2] * (2 * zz - xx - yy) * sh_rest[:, 5]
-				+ C2[3] * xz * sh_rest[:, 6]
-				+ C2[4] * (xx - yy) * sh_rest[:, 7]
-			)
-			if degree > 2:
-				rgb = (
-					rgb
-					+ C3[0] * y * (3 * xx - yy) * sh_rest[:, 8]
-					+ C3[1] * xy * z * sh_rest[:, 9]
-					+ C3[2] * y * (4 * zz - xx - yy) * sh_rest[:, 10]
-					+ C3[3] * z * (2 * zz - 3 * xx - 3 * yy) * sh_rest[:, 11]
-					+ C3[4] * x * (4 * zz - xx - yy) * sh_rest[:, 12]
-					+ C3[5] * z * (xx - yy) * sh_rest[:, 13]
-					+ C3[6] * x * (xx - 3 * yy) * sh_rest[:, 14]
-				)
-	return rgb.clamp_min(0.0)
+	return EvalSH.apply(sh_dc.contiguous(), sh_rest.contiguous(), dirs.contiguous(), degree)
 
 
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
