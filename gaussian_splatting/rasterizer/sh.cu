@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include "common.cuh"
+#include "api.h"
 
 __constant__ float C[16] = {
 	0.28209479177387814f,

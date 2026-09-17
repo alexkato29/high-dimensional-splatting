@@ -1,45 +1,5 @@
-#include <torch/extension.h>
+#include "api.h"
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize(
-	torch::Tensor means2D,
-	torch::Tensor depths,
-	torch::Tensor radii,
-	torch::Tensor conics,
-	torch::Tensor colors,
-	torch::Tensor opacities,
-	torch::Tensor background,
-	int image_width,
-	int image_height
-);
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_backward(
-	torch::Tensor grad_image,
-	torch::Tensor means2D,
-	torch::Tensor conic,
-	torch::Tensor color_opacity,
-	torch::Tensor values_sorted,
-	torch::Tensor tile_ranges,
-	torch::Tensor final_transmittance,
-	torch::Tensor n_contrib,
-	torch::Tensor background,
-	int image_width,
-	int image_height
-);
-
-torch::Tensor eval_sh(
-	torch::Tensor sh_dc,
-	torch::Tensor sh_rest,
-	torch::Tensor dirs,
-	int degree
-);
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> eval_sh_backward_host(
-	torch::Tensor grad_rgb,
-	torch::Tensor sh_dc,
-	torch::Tensor sh_rest,
-	torch::Tensor dirs,
-	int degree
-);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("rasterize", &rasterize, "Gaussian Splatting Rasterizer (CUDA)",
@@ -79,4 +39,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("dirs"),
 		py::arg("degree")
 	);
+	m.def("project_gaussians", &project_gaussians, "Project gaussians into the image plane (CUDA)");
+	m.def("project_gaussians_backward", &project_gaussians_backward, "Projection backward (CUDA)");
 }

@@ -24,7 +24,13 @@ def num_sh_coeffs(degree: int) -> int:
 
 
 class EvalSH(torch.autograd.Function):
-	"""Autograd node wrapping the CUDA spherical harmonics kernels."""
+	"""Turns learned spherical harmonic weights into an RGB color per gaussian, in one CUDA kernel.
+
+	One thread per gaussian evaluates the basis functions for its viewing direction and mixes the
+	weights, so no basis or coefficient tensor is ever materialized. Call it through eval_sh with
+	sh_dc [N, 1, 3], sh_rest [N, 15, 3], dirs [N, 3] and the highest degree to evaluate, and it
+	returns [N, 3] RGB offset by 0.5 and clamped to non-negative.
+	"""
 
 	@staticmethod
 	def forward(ctx, sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degree: int) -> torch.Tensor:
@@ -40,6 +46,7 @@ class EvalSH(torch.autograd.Function):
 		Returns:
 			[N, 3] RGB.
 		"""
+		sh_dc, sh_rest, dirs = sh_dc.contiguous(), sh_rest.contiguous(), dirs.contiguous()
 		ctx.save_for_backward(sh_dc, sh_rest, dirs)
 		ctx.degree = degree
 		return _get_rasterizer().eval_sh(sh_dc, sh_rest, dirs, degree)
@@ -62,22 +69,7 @@ class EvalSH(torch.autograd.Function):
 		return grad_dc, grad_rest, grad_dirs, None
 
 
-def eval_sh(sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degree: int) -> torch.Tensor:
-	"""Turns learned spherical harmonic weights into an RGB color per gaussian.
-
-	One CUDA thread per gaussian evaluates the basis functions for its viewing direction and mixes
-	the weights, so no basis or coefficient tensor is ever materialized.
-
-	Args:
-		sh_dc: [N, 1, 3] degree 0 weights.
-		sh_rest: [N, 15, 3] weights for degrees 1 through 3, ordered by increasing degree.
-		dirs: [N, 3] unit vectors from the camera to each gaussian.
-		degree: Highest degree to use, so every band above it is ignored.
-
-	Returns:
-		[N, 3] RGB, offset by 0.5 so all zero weights mean mid gray, clamped to non-negative.
-	"""
-	return EvalSH.apply(sh_dc.contiguous(), sh_rest.contiguous(), dirs.contiguous(), degree)
+eval_sh = EvalSH.apply
 
 
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:

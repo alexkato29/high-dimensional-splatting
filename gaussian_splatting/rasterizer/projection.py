@@ -22,76 +22,72 @@ def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:
 	], dim=-1).reshape(-1, 3, 3)
 
 
-def project_gaussians(
-	means: torch.Tensor,
-	scales: torch.Tensor,
-	quats: torch.Tensor,
-	world_to_camera: torch.Tensor,
-	fx: float,
-	fy: float,
-	cx: float,
-	cy: float,
-	width: int,
-	height: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""Projects 3D gaussians into the image plane as 2D gaussians.
+class ProjectGaussians(torch.autograd.Function):
+	"""Projects 3D gaussians into the image plane as 2D gaussians, in one CUDA kernel.
 
-	Args:
-		means: [N, 3] gaussian centers in world space.
-		scales: [N, 3] per axis standard deviations, already activated.
-		quats: [N, 4] unit quaternions ordered (w, x, y, z).
-		world_to_camera: [4, 4] world to camera transform.
-		fx: Horizontal focal length in pixels.
-		fy: Vertical focal length in pixels.
-		cx: Horizontal principal point in pixels.
-		cy: Vertical principal point in pixels.
-		width: Image width in pixels.
-		height: Image height in pixels.
-
-	Returns:
-		A tuple of four tensors.
-			means2D: [N, 2] centers in pixels.
-			depths: [N] camera space z, used only to sort.
-			radii: [N] footprint radius in pixels, 0 for culled gaussians and not differentiable.
-			conics: [N, 3] inverse 2D covariance as (xx, xy, yy).
+	Call it through project_gaussians with means [N, 3], activated scales [N, 3], unit quats [N, 4],
+	the [4, 4] world to camera transform, the intrinsics and the image size. It returns means2D
+	[N, 2] in pixels, depths [N] used only to sort, radii [N] which are 0 for culled gaussians and
+	carry no gradient, and conics [N, 3] as the inverse 2D covariance (xx, xy, yy).
 	"""
-	# torch.compile's inductor knows that, more often than not, cuBLAS is faster than any generated
-	# kernel. So, it defaults to calling it. However, cuBLAS is rather slow for our 3x3 GEMMs due
-	# to overhead. This thus doesn't remotely approach the handwritten CUDA implementation in
-	# terms of runtime. But, we implement it in torch to save sanity on the backward pass.
-	R = world_to_camera[:3, :3]
-	p = means @ R.T + world_to_camera[:3, 3]
-	depths = p[:, 2]
-	x, y, z = p[:, 0], p[:, 1], depths.clamp_min(NEAR_PLANE)
-	means2D = torch.stack([fx * x / z + cx, fy * y / z + cy], dim=-1)
 
-	z_inv = 1 / (z + 1e-6)
-	limit_x = JACOBIAN_FOV_SCALE * (0.5 * width / fx)
-	limit_y = JACOBIAN_FOV_SCALE * (0.5 * height / fy)
-	jx = (x * z_inv).clamp(-limit_x, limit_x) * z
-	jy = (y * z_inv).clamp(-limit_y, limit_y) * z
-	jw0 = (fx * z_inv)[:, None] * R[0] - (fx * jx * z_inv * z_inv)[:, None] * R[2]
-	jw1 = (fy * z_inv)[:, None] * R[1] - (fy * jy * z_inv * z_inv)[:, None] * R[2]
+	@staticmethod
+	def forward(ctx, means, scales, quats, world_to_camera, fx, fy, cx, cy, width, height):
+		"""Projects the gaussians and saves the inputs the backward recomputes from.
 
-	M = quat_to_rotmat(quats) * scales[:, None, :]
-	t0 = (jw0[:, :, None] * M).sum(dim=1)
-	t1 = (jw1[:, :, None] * M).sum(dim=1)
-	a = (t0 * t0).sum(dim=-1) + LOW_PASS
-	b = (t0 * t1).sum(dim=-1)
-	c = (t1 * t1).sum(dim=-1) + LOW_PASS
+		Args:
+			ctx: Autograd context the saved tensors are stashed on.
+			means: [N, 3] gaussian centers in world space.
+			scales: [N, 3] per axis standard deviations, already activated.
+			quats: [N, 4] unit quaternions ordered (w, x, y, z).
+			world_to_camera: [4, 4] world to camera transform.
+			fx: Horizontal focal length in pixels.
+			fy: Vertical focal length in pixels.
+			cx: Horizontal principal point in pixels.
+			cy: Vertical principal point in pixels.
+			width: Image width in pixels.
+			height: Image height in pixels.
 
-	det = a * c - b * b
-	conics = torch.stack([c, -b, a], dim=-1) / torch.where(det > 0, det, 1.0)[:, None]
+		Returns:
+			means2D, depths, radii and conics, as project_gaussians_torch returns them.
+		"""
+		from gaussian_splatting.rasterizer import _get_rasterizer
 
-	with torch.no_grad():
-		trace = a + c
-		radii = 3 * torch.sqrt(0.5 * (trace + torch.sqrt((trace * trace - 4 * det).clamp_min(0))))
-		u, v = means2D.unbind(-1)
-		visible = (
-			(depths > NEAR_PLANE)
-			& (u - radii <= width) & (u + radii >= 0) & (v - radii <= height) & (v + radii >= 0)
-			& (det > 0)
+		means, scales, quats = means.contiguous(), scales.contiguous(), quats.contiguous()
+		outputs = _get_rasterizer().project_gaussians(
+			means, scales, quats, world_to_camera, fx, fy, cx, cy, width, height,
+			NEAR_PLANE, LOW_PASS, JACOBIAN_FOV_SCALE
 		)
-		radii = torch.where(visible, radii, 0.0)
+		ctx.save_for_backward(means, scales, quats, world_to_camera)
+		ctx.camera = (fx, fy, cx, cy, width, height)
+		ctx.mark_non_differentiable(outputs[1], outputs[2])
+		return outputs
 
-	return means2D, depths, radii, conics
+	@staticmethod
+	def backward(ctx, grad_means2D, grad_depths, grad_radii, grad_conics):
+		"""Recomputes the projection and walks the gradients back to the parameters.
+
+		Depths and radii carry no gradient, matching the torch version where radii is computed
+		under no_grad and depths only ever feeds the sort.
+
+		Args:
+			ctx: Autograd context holding the saved inputs.
+			grad_means2D: [N, 2] gradient of the loss with respect to the pixel centers.
+			grad_depths: Ignored.
+			grad_radii: Ignored.
+			grad_conics: [N, 3] gradient of the loss with respect to the conics.
+
+		Returns:
+			Gradients for means, scales and quats, and None for the camera arguments.
+		"""
+		from gaussian_splatting.rasterizer import _get_rasterizer
+
+		means, scales, quats, world_to_camera = ctx.saved_tensors
+		grads = _get_rasterizer().project_gaussians_backward(
+			grad_means2D.contiguous(), grad_conics.contiguous(), means, scales, quats,
+			world_to_camera, *ctx.camera, NEAR_PLANE, LOW_PASS, JACOBIAN_FOV_SCALE
+		)
+		return (*grads, None, None, None, None, None, None, None)
+
+
+project_gaussians = ProjectGaussians.apply

@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include "common.cuh"
+#include "api.h"
 
 __global__ void render_gaussians_backward(
 	const uint2* tile_ranges,
