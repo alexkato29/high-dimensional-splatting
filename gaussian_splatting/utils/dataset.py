@@ -12,6 +12,7 @@ class Camera:
 	image_id: int
 	name: str
 	world_to_camera: torch.Tensor  # [4, 4] float32
+	center: torch.Tensor  # [3] camera position in world space
 	fx: float
 	fy: float
 	cx: float
@@ -19,15 +20,6 @@ class Camera:
 	width: int
 	height: int
 	image: torch.Tensor  # [H, W, 3] uint8.
-
-	@property
-	def center(self) -> torch.Tensor:
-		"""Position of this camera in world space.
-
-		Returns:
-			[3] translation of the camera to world transform, used as the origin for view directions.
-		"""
-		return self.world_to_camera.inverse()[:3, 3]
 
 
 @dataclass
@@ -114,6 +106,7 @@ class ColmapDataset:
 			image_id=colmap_img.image_id,
 			name=colmap_img.name,
 			world_to_camera=world_to_camera.to(device),
+			center=world_to_camera.inverse()[:3, 3].to(device),
 			fx=colmap_cam.focal_length_x * sx,
 			fy=colmap_cam.focal_length_y * sy,
 			cx=colmap_cam.principal_point_x * sx,
