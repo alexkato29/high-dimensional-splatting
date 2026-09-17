@@ -36,11 +36,6 @@ def project_gaussians(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Projects 3D gaussians into the image plane as 2D gaussians.
 
-	Each gaussian's 3D covariance is built from its scale and rotation, pushed through the
-	perspective projection's local linear approximation, and blurred slightly so that a gaussian
-	thinner than a pixel still covers one. Autograd differentiates all of it, which is why this
-	stays in torch rather than CUDA.
-
 	Args:
 		means: [N, 3] gaussian centers in world space.
 		scales: [N, 3] per axis standard deviations, already activated.
@@ -70,24 +65,20 @@ def project_gaussians(
 	x, y, z = p[:, 0], p[:, 1], depths.clamp_min(NEAR_PLANE)
 	means2D = torch.stack([fx * x / z + cx, fy * y / z + cy], dim=-1)
 
-	M = quat_to_rotmat(quats) * scales[:, None, :]
-	cov3D = M @ M.transpose(1, 2)
-
 	z_inv = 1 / (z + 1e-6)
 	limit_x = JACOBIAN_FOV_SCALE * (0.5 * width / fx)
 	limit_y = JACOBIAN_FOV_SCALE * (0.5 * height / fy)
 	jx = (x * z_inv).clamp(-limit_x, limit_x) * z
 	jy = (y * z_inv).clamp(-limit_y, limit_y) * z
-	zeros = torch.zeros_like(z)
-	J = torch.stack([
-		fx * z_inv, zeros, -fx * jx * z_inv * z_inv,
-		zeros, fy * z_inv, -fy * jy * z_inv * z_inv,
-	], dim=-1).reshape(-1, 2, 3)
-	JW = J @ R
-	cov2D = JW @ cov3D @ JW.transpose(1, 2)
-	a = cov2D[:, 0, 0] + LOW_PASS
-	b = cov2D[:, 0, 1]
-	c = cov2D[:, 1, 1] + LOW_PASS
+	jw0 = (fx * z_inv)[:, None] * R[0] - (fx * jx * z_inv * z_inv)[:, None] * R[2]
+	jw1 = (fy * z_inv)[:, None] * R[1] - (fy * jy * z_inv * z_inv)[:, None] * R[2]
+
+	M = quat_to_rotmat(quats) * scales[:, None, :]
+	t0 = (jw0[:, :, None] * M).sum(dim=1)
+	t1 = (jw1[:, :, None] * M).sum(dim=1)
+	a = (t0 * t0).sum(dim=-1) + LOW_PASS
+	b = (t0 * t1).sum(dim=-1)
+	c = (t1 * t1).sum(dim=-1) + LOW_PASS
 
 	det = a * c - b * b
 	conics = torch.stack([c, -b, a], dim=-1) / torch.where(det > 0, det, 1.0)[:, None]
