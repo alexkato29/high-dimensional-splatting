@@ -105,8 +105,7 @@ class GaussianModel:
 			[N, 3] RGB of every gaussian as seen from camera_center.
 		"""
 		dirs = F.normalize(self.means - camera_center, dim=-1)
-		sh = torch.cat([self.params["sh_dc"], self.params["sh_rest"]], dim=1)
-		return eval_sh(sh, dirs, self.active_sh_degree)
+		return eval_sh(self.params["sh_dc"], self.params["sh_rest"], dirs, self.active_sh_degree)
 
 	def get_optimizer_params(self, params: TrainingParams, extent: float) -> list[dict[str, Any]]:
 		"""Builds the Adam parameter groups, one per tensor so each gets its own learning rate.
