@@ -3,6 +3,12 @@
 #include "common.cuh"
 #include "api.h"
 
+__device__ inline float warp_sum(float v) {
+	for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffffu, v, offset);
+	return v;
+}
+
+
 __global__ void render_gaussians_backward(
 	const uint2* tile_ranges,
 	const int* tiled_gaussian_values_sorted,
@@ -74,50 +80,79 @@ __global__ void render_gaussians_backward(
 		__syncthreads();
 
 		for (int j = batch_count - 1; j >= 0; j--) {
-			if (!inside || batch_start + j + 1 > last_contributor) continue;
+			bool contributes = inside && batch_start + j + 1 <= last_contributor;
+			float dL_dcolor = 0.0f, dL_dopacity = 0.0f;
+			float2 dL_dmean2D = make_float2(0.0f, 0.0f);
+			float3 dL_dconic = make_float3(0.0f, 0.0f, 0.0f);
 
-			float2 mean = s_mean[j];
-			float4 c = s_conic[j];
-			float dx = pixel.x - mean.x;
-			float dy = pixel.y - mean.y;
-			float mahalanobis = dx * (c.x * dx + c.y * dy) +
-								dy * (c.y * dx + c.z * dy);
-			float G = __expf(-0.5f * mahalanobis);
+			if (contributes) {
+				float2 mean = s_mean[j];
+				float4 c = s_conic[j];
+				float dx = pixel.x - mean.x;
+				float dy = pixel.y - mean.y;
+				float mahalanobis = dx * (c.x * dx + c.y * dy) +
+									dy * (c.y * dx + c.z * dy);
+				float G = __expf(-0.5f * mahalanobis);
 
-			float4 color = s_color[j];
-			float raw_alpha = color.w * G;
-			float alpha = fminf(MAX_ALPHA, raw_alpha);
-			if (alpha < MIN_ALPHA) continue;
+				float4 color = s_color[j];
+				float raw_alpha = color.w * G;
+				float alpha = fminf(MAX_ALPHA, raw_alpha);
+				contributes = alpha >= MIN_ALPHA;
 
-			transmittance /= (1.0f - alpha);
+				if (contributes) {
+					transmittance /= (1.0f - alpha);
 
-			accum_rec.x = last_alpha * last_color.x + (1.0f - last_alpha) * accum_rec.x;
-			accum_rec.y = last_alpha * last_color.y + (1.0f - last_alpha) * accum_rec.y;
-			accum_rec.z = last_alpha * last_color.z + (1.0f - last_alpha) * accum_rec.z;
-			last_color = make_float3(color.x, color.y, color.z);
-			last_alpha = alpha;
+					accum_rec.x = last_alpha * last_color.x + (1.0f - last_alpha) * accum_rec.x;
+					accum_rec.y = last_alpha * last_color.y + (1.0f - last_alpha) * accum_rec.y;
+					accum_rec.z = last_alpha * last_color.z + (1.0f - last_alpha) * accum_rec.z;
+					last_color = make_float3(color.x, color.y, color.z);
+					last_alpha = alpha;
 
-			float dL_dalpha = ((color.x - accum_rec.x) * dL_dpixel.x
-							 + (color.y - accum_rec.y) * dL_dpixel.y
-							 + (color.z - accum_rec.z) * dL_dpixel.z) * transmittance
-							- final_T / (1.0f - alpha) * dL_dfinal_T;
+					float dL_dalpha = ((color.x - accum_rec.x) * dL_dpixel.x
+									 + (color.y - accum_rec.y) * dL_dpixel.y
+									 + (color.z - accum_rec.z) * dL_dpixel.z) * transmittance
+									- final_T / (1.0f - alpha) * dL_dfinal_T;
 
-			int g = s_id[j];
-			float dL_dcolor = alpha * transmittance;
-			atomicAdd(&grad_colors[g * 3 + 0], dL_dcolor * dL_dpixel.x);
-			atomicAdd(&grad_colors[g * 3 + 1], dL_dcolor * dL_dpixel.y);
-			atomicAdd(&grad_colors[g * 3 + 2], dL_dcolor * dL_dpixel.z);
+					dL_dcolor = alpha * transmittance;
 
-			if (raw_alpha > MAX_ALPHA) continue;
+					// A clamped alpha no longer depends on the gaussian, so nothing flows past it.
+					if (raw_alpha <= MAX_ALPHA) {
+						dL_dopacity = G * dL_dalpha;
+						float dL_dG = color.w * dL_dalpha;
+						dL_dmean2D = make_float2(dL_dG * G * (c.x * dx + c.y * dy),
+												 dL_dG * G * (c.y * dx + c.z * dy));
+						dL_dconic = make_float3(dL_dG * G * -0.5f * dx * dx,
+												dL_dG * G * -dx * dy,
+												dL_dG * G * -0.5f * dy * dy);
+					}
+				}
+			}
 
-			atomicAdd(&grad_opacities[g], G * dL_dalpha);
+			if (__any_sync(0xffffffffu, contributes)) {
+				float grad_color_x = warp_sum(dL_dcolor * dL_dpixel.x);
+				float grad_color_y = warp_sum(dL_dcolor * dL_dpixel.y);
+				float grad_color_z = warp_sum(dL_dcolor * dL_dpixel.z);
+				float grad_opacity = warp_sum(dL_dopacity);
+				float grad_mean_x = warp_sum(dL_dmean2D.x);
+				float grad_mean_y = warp_sum(dL_dmean2D.y);
+				float grad_conic_x = warp_sum(dL_dconic.x);
+				float grad_conic_y = warp_sum(dL_dconic.y);
+				float grad_conic_z = warp_sum(dL_dconic.z);
 
-			float dL_dG = color.w * dL_dalpha;
-			atomicAdd(&grad_means2D[g * 2 + 0], dL_dG * G * (c.x * dx + c.y * dy));
-			atomicAdd(&grad_means2D[g * 2 + 1], dL_dG * G * (c.y * dx + c.z * dy));
-			atomicAdd(&grad_conics[g * 3 + 0], dL_dG * G * -0.5f * dx * dx);
-			atomicAdd(&grad_conics[g * 3 + 1], dL_dG * G * -dx * dy);
-			atomicAdd(&grad_conics[g * 3 + 2], dL_dG * G * -0.5f * dy * dy);
+				if ((tid & 31) == 0) {
+					int g = s_id[j];
+					// On an L4, there are no vectorized atomic instructions.
+					atomicAdd(&grad_colors[g * 3 + 0], grad_color_x);
+					atomicAdd(&grad_colors[g * 3 + 1], grad_color_y);
+					atomicAdd(&grad_colors[g * 3 + 2], grad_color_z);
+					atomicAdd(&grad_opacities[g], grad_opacity);
+					atomicAdd(&grad_means2D[g * 2 + 0], grad_mean_x);
+					atomicAdd(&grad_means2D[g * 2 + 1], grad_mean_y);
+					atomicAdd(&grad_conics[g * 3 + 0], grad_conic_x);
+					atomicAdd(&grad_conics[g * 3 + 1], grad_conic_y);
+					atomicAdd(&grad_conics[g * 3 + 2], grad_conic_z);
+				}
+			}
 		}
 	}
 }
