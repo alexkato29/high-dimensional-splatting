@@ -3,8 +3,8 @@
 #include "common.cuh"
 #include "api.h"
 
-__device__ inline float warp_sum(float v) {
-	for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffffu, v, offset);
+__device__ inline float warp_octet_sum(float v) {
+	for (int offset = 4; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffffu, v, offset);
 	return v;
 }
 
@@ -128,18 +128,19 @@ __global__ void render_gaussians_backward(
 				}
 			}
 
-			if (__any_sync(0xffffffffu, contributes)) {
-				float grad_color_x = warp_sum(dL_dcolor * dL_dpixel.x);
-				float grad_color_y = warp_sum(dL_dcolor * dL_dpixel.y);
-				float grad_color_z = warp_sum(dL_dcolor * dL_dpixel.z);
-				float grad_opacity = warp_sum(dL_dopacity);
-				float grad_mean_x = warp_sum(dL_dmean2D.x);
-				float grad_mean_y = warp_sum(dL_dmean2D.y);
-				float grad_conic_x = warp_sum(dL_dconic.x);
-				float grad_conic_y = warp_sum(dL_dconic.y);
-				float grad_conic_z = warp_sum(dL_dconic.z);
+			unsigned int active = __ballot_sync(0xffffffffu, contributes);
+			if (active) {
+				float grad_color_x = warp_octet_sum(dL_dcolor * dL_dpixel.x);
+				float grad_color_y = warp_octet_sum(dL_dcolor * dL_dpixel.y);
+				float grad_color_z = warp_octet_sum(dL_dcolor * dL_dpixel.z);
+				float grad_opacity = warp_octet_sum(dL_dopacity);
+				float grad_mean_x = warp_octet_sum(dL_dmean2D.x);
+				float grad_mean_y = warp_octet_sum(dL_dmean2D.y);
+				float grad_conic_x = warp_octet_sum(dL_dconic.x);
+				float grad_conic_y = warp_octet_sum(dL_dconic.y);
+				float grad_conic_z = warp_octet_sum(dL_dconic.z);
 
-				if ((tid & 31) == 0) {
+				if ((tid & 7) == 0 && ((active >> (tid & 31)) & 0xffu)) {
 					int g = s_id[j];
 					// On an L4, there are no vectorized atomic instructions.
 					atomicAdd(&grad_colors[g * 3 + 0], grad_color_x);
