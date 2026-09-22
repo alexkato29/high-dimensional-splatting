@@ -7,6 +7,7 @@
 #include <thrust/sequence.h>
 #include <cub/device/device_radix_sort.cuh>
 #include "common.cuh"
+#include "api.h"
 
 
 __global__ void prepare_gaussians(
@@ -34,20 +35,40 @@ __global__ void prepare_gaussians(
 		return;
 	}
 
-	// duplicate_gaussians is memory bound and wants everything it needs in one vectorized load,
-	// while render_gaussians only reads the means, so the means live in both places.
-	float2 uv = means2D[idx];
-	gaussian_data[idx] = make_float4(uv.x, uv.y, radius, depths[idx]);
+	// Peak alpha is the opacity itself, at the center where the falloff is 1. A gaussian that
+	// cannot reach MIN_ALPHA at its own center cannot reach it anywhere, so it is never blended.
+	float opacity = opacities[idx];
+	if (!(opacity > MIN_ALPHA)) {
+		tiles_touched[idx] = 0;
+		return;
+	}
 
 	// Color and conic are 12B at 12B alignment, which the compiler must split into three LDG.E.
 	// Padding each to a float4 (opacity parked in the color's spare lane) allows vectorized
 	// access in the render loop.
-	conic[idx] = make_float4(conics[idx*3 + 0], conics[idx*3 + 1], conics[idx*3 + 2], 0.0f);
+	float a_conic = conics[idx*3 + 0];
+	float b_conic = conics[idx*3 + 1];
+	float c_conic = conics[idx*3 + 2];
+	conic[idx] = make_float4(a_conic, b_conic, c_conic, 0.0f);
 	color_opacity[idx] = make_float4(
-		colors[idx*3 + 0], colors[idx*3 + 1], colors[idx*3 + 2], opacities[idx]);
+		colors[idx*3 + 0], colors[idx*3 + 1], colors[idx*3 + 2], opacity);
 
-	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
-	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
+	// The render loop drops alpha below MIN_ALPHA, so the footprint that can matter stops exactly at
+	// the k sigma level set where opacity * exp(-k*k/2) equals MIN_ALPHA. This is not the old fixed
+	// 3 sigma, which both overshoots faint gaussians and clips opaque ones (3 sigma leaves alpha at
+	// 0.011 for an opacity of 1, still well above MIN_ALPHA).
+	float k = sqrtf(2.0f * logf(opacity / MIN_ALPHA));
+
+	// The conic is the inverse covariance, so invert it back to read the covariance diagonal. The
+	// half extent of a level set along an axis is k * sqrt of that axis variance, which is exact,
+	// where the old single radius used the largest eigenvalue on both axes.
+	float det_conic = a_conic * c_conic - b_conic * b_conic;
+	float extent_x = k * sqrtf(c_conic / det_conic);
+	float extent_y = k * sqrtf(a_conic / det_conic);
+
+	float2 uv = means2D[idx];
+	float2 min_pixel = make_float2(uv.x - extent_x, uv.y - extent_y);
+	float2 max_pixel = make_float2(uv.x + extent_x, uv.y + extent_y);
 
 	int2 tile_min_coords = pixel_to_tile(min_pixel);
 	int2 tile_max_coords = pixel_to_tile(max_pixel);
@@ -57,7 +78,23 @@ __global__ void prepare_gaussians(
 	tile_max_coords.x = min(num_tiles_x - 1, tile_max_coords.x);
 	tile_max_coords.y = min(num_tiles_y - 1, tile_max_coords.y);
 
-	tiles_touched[idx] = (tile_max_coords.x - tile_min_coords.x + 1) * (tile_max_coords.y - tile_min_coords.y + 1);
+	int tile_width  = tile_max_coords.x - tile_min_coords.x + 1;
+	int tile_height = tile_max_coords.y - tile_min_coords.y + 1;
+
+	// The visibility test upstream uses the larger eigenvalue radius, so a gaussian can pass it and
+	// still have this tighter box land entirely off screen, leaving an empty rectangle.
+	if (tile_width <= 0 || tile_height <= 0) {
+		tiles_touched[idx] = 0;
+		return;
+	}
+
+	// duplicate_gaussians is memory bound, so hand it the finished tile rectangle in one vectorized
+	// load instead of the position and radius it would have to turn into tiles all over again. It
+	// also means the count here and the emission there can never disagree.
+	gaussian_data[idx] = make_float4(
+		(float)tile_min_coords.x, (float)tile_min_coords.y, (float)tile_width, depths[idx]);
+
+	tiles_touched[idx] = tile_width * tile_height;
 }
 
 __device__ int find_gaussian_binary_search(
@@ -85,7 +122,6 @@ __global__ void duplicate_gaussians(
 	const int* offsets,
 	const float4* gaussian_data,
 	int num_tiles_x,
-	int num_tiles_y,
 	uint64_t* tiled_gaussian_keys,
 	int* tiled_gaussian_values
 ) {
@@ -94,27 +130,17 @@ __global__ void duplicate_gaussians(
 
 	int gaussian_idx = find_gaussian_binary_search(offsets, num_gaussians, output_idx);
 
+	// prepare_gaussians already clamped this rectangle to the screen.
 	float4 data = gaussian_data[gaussian_idx];
-	float2 uv = make_float2(data.x, data.y);
-	float radius = data.z;
+	int tile_min_x = (int)data.x;
+	int tile_min_y = (int)data.y;
+	int tile_width = (int)data.z;
 	float depth = data.w;
 	uint32_t depth_bits = *((uint32_t*)&depth);
 
-	float2 min_pixel = make_float2(uv.x - radius, uv.y - radius);
-	float2 max_pixel = make_float2(uv.x + radius, uv.y + radius);
-
-	int2 gaussian_min_tile_coords = pixel_to_tile(min_pixel);
-	int2 gaussian_max_tile_coords = pixel_to_tile(max_pixel);
-
-	gaussian_min_tile_coords.x = max(0, gaussian_min_tile_coords.x);
-	gaussian_min_tile_coords.y = max(0, gaussian_min_tile_coords.y);
-	gaussian_max_tile_coords.x = min(num_tiles_x - 1, gaussian_max_tile_coords.x);
-	gaussian_max_tile_coords.y = min(num_tiles_y - 1, gaussian_max_tile_coords.y);
-
 	int local_idx = output_idx - offsets[gaussian_idx];
-	int gaussian_width = gaussian_max_tile_coords.x - gaussian_min_tile_coords.x + 1;
-	int tile_y = gaussian_min_tile_coords.y + local_idx / gaussian_width;
-	int tile_x = gaussian_min_tile_coords.x + local_idx % gaussian_width;
+	int tile_y = tile_min_y + local_idx / tile_width;
+	int tile_x = tile_min_x + local_idx % tile_width;
 
 	int tile_idx = tile_y * num_tiles_x + tile_x;
 	uint64_t key = ((uint64_t)tile_idx << 32) | depth_bits;
@@ -356,7 +382,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 		offsets_ptr,
 		gaussian_data_ptr,
 		num_tiles_x,
-		num_tiles_y,
 		tiled_gaussian_keys,
 		tiled_gaussian_values
 	);
