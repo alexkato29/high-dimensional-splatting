@@ -89,7 +89,8 @@ __global__ void render_gaussians_backward(
 		__syncthreads();
 
 		for (int j = batch_count - 1; j >= 0; j--) {
-			bool contributes = inside && batch_start + j + 1 <= last_contributor;
+			int gaussian_depth_idx = batch_start + j;
+			bool contributes = inside && gaussian_depth_idx < last_contributor;
 			float dL_dcolor = 0.0f, dL_dopacity = 0.0f;
 			float2 dL_dmean2D = make_float2(0.0f, 0.0f);
 			float3 dL_dconic = make_float3(0.0f, 0.0f, 0.0f);
