@@ -55,6 +55,15 @@ __global__ void render_gaussians_backward(
 			grad_image[pixel_idx * 3 + 2]);
 	}
 
+	// The loop walks back to front, so everything past the block's deepest contributor fails the
+	// range gate for every pixel here. Start below it instead of burning iterations on the tail.
+	__shared__ int s_last_contributor;
+	if (tid == 0) s_last_contributor = 0;
+	__syncthreads();
+	atomicMax(&s_last_contributor, last_contributor);
+	__syncthreads();
+	num_todo = min(num_todo, s_last_contributor);
+
 	const float final_T = transmittance;
 	const float dL_dfinal_T = background[0] * dL_dpixel.x
 							+ background[1] * dL_dpixel.y
