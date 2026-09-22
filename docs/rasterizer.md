@@ -233,3 +233,84 @@ DRAM Throughput [%]	7.72
 Mem Pipes Busy [%]	83.50
 ```
 Much better, though it doesn't match the theoretical. That is because, if you work it out, the atomic lanes per gaussian at 3 shuffles really works out to be 2.55, not the theoretical 4.
+
+##### (5) Set and verify kernels against expectations
+GPU kernels have a small footprint, but they're also deceptively complex. Both mean it's increasingly important to be in tune not just with what every line *should* do, but what every line *actually* does.
+
+Take our backward pass. On profile, it showed `l1tex__t_requests_pipe_lsu_mem_global_op_red.sum: 28,148,949`. The reduction sum is just `atomicAdd`, so it's writing ~28M gradients. Notice from the code block:
+```
+unsigned int active = __ballot_sync(0xffffffffu, contributes);
+if (active) {
+    float grad_color_x = warp_octet_sum(dL_dcolor * dL_dpixel.x);
+    float grad_color_y = warp_octet_sum(dL_dcolor * dL_dpixel.y);
+    float grad_color_z = warp_octet_sum(dL_dcolor * dL_dpixel.z);
+    float grad_opacity = warp_octet_sum(dL_dopacity);
+    float grad_mean_x = warp_octet_sum(dL_dmean2D.x);
+    float grad_mean_y = warp_octet_sum(dL_dmean2D.y);
+    float grad_conic_x = warp_octet_sum(dL_dconic.x);
+    float grad_conic_y = warp_octet_sum(dL_dconic.y);
+    float grad_conic_z = warp_octet_sum(dL_dconic.z);
+
+    if ((tid & 7) == 0 && ((active >> (tid & 31)) & 0xffu)) {
+        int g = s_id[j];
+        // On an L4, there are no vectorized atomic instructions.
+        atomicAdd(&grad_colors[g * 3 + 0], grad_color_x);
+        atomicAdd(&grad_colors[g * 3 + 1], grad_color_y);
+        atomicAdd(&grad_colors[g * 3 + 2], grad_color_z);
+        atomicAdd(&grad_opacities[g], grad_opacity);
+        atomicAdd(&grad_means2D[g * 2 + 0], grad_mean_x);
+        atomicAdd(&grad_means2D[g * 2 + 1], grad_mean_y);
+        atomicAdd(&grad_conics[g * 3 + 0], grad_conic_x);
+        atomicAdd(&grad_conics[g * 3 + 1], grad_conic_y);
+        atomicAdd(&grad_conics[g * 3 + 2], grad_conic_z);
+    }
+}
+```
+
+Each gradient is computed from the same set of values (`dL_dcolor`, `dL_dpixel`, etc.). Since there are 9 `atomicAdd` operations, really we are computing `28,148,949 / 9 = 3,127,661` gradients. Okay, well at first thought we should expect that the inner gradient computation loop runs ~3.1M times. Let's check the source counters just to compare.
+
+| SASS instruction | source line | executions | runs once per |
+| --- | --- | ---: | --- |
+| `VOTE.ANY` | `__ballot_sync(0xffffffffu, contributes)` | 19,439,224 | warp-gaussians iterations |
+| `FSETP.GE.FTZ.AND` | `alpha >= MIN_ALPHA` | 16,645,355 | iteration past the first gate |
+| `RED.E.ADD.F32` | the 9 `atomicAdd` calls | 28,148,949 | gradient written (x9) |
+|  | Scaled `atomicAdd` calls | 3,127,661 | iteration with at least one computed gradient |
+
+This math... is a bit suspicious. The counters are telling us:
+- We check ~19.4M total warp-gaussians pairs.
+- Of those, only ~16.6M warp-gaussian pairs even *theoretically* contribute to at least one gradient (have a pixel on screen).
+- Of those, only ~3.1M warp-gaussian pairs *actually* contribute to at least one gradient.
+
+Let's address the 16.6M v. 3.1M discrepancy first. What might cause this? Well, one obvious pitfall of the algorithm: consider a tile that has all its gaussians only in row `K`. A warp that covers no pixels in row `K` will never contribute to gradients in this tile. That's a known limitation of the algorithm.
+
+But, it's worth making sure we know if this is *the* reason. After all, for 8 warps in a tile, the max multiple of theoretical to performed work is `x8` (only one warp ever has gaussians in its pixels), and `x5.32` is not all that far off. This multiple is, again due to the algorithm, unavoidable. But we want to make sure that all the gaussians contribute to at *least* one warp. If they contribute to none, there's a problem...
+
+Lo and behold, `54.3%` of tile-gaussian pairs touch zero pixels. That's really bad, half of our work was destined to be wasted right off the bat.
+
+This issue could be hiding anywhere, and in 2026 the fastest way to find it is to point Claude at the code. It called out that, in `prepare_gaussians`, we are computing gaussian/tile overlap by modeling gaussians as squares with width x2 their largest covariance axis. When gaussians are long and flat, that's naive. And, it turns out, our gaussians are long and flat.
+
+Modeling gaussians as rectangles instead of squares brought this ratio down to `16.8%` (224,327 tile-gaussian pairs). This is an amazing speedup. Why? Not only does it make the backward pass faster, but it shrinks the number of tile-gaussian duplicates for *every* kernel.
+
+Now, we may address the less costly issue of the 19.4M to 16.6M discrepancy. Due to grid sizing, some tiles will have rows off the bottom of the image. Warps will be completely off screen. That's expected, and they're used for cooperative loads. But, that number only turns out to be `176,484 warp-gaussian` pairs, a small fraction of the nearly 3M. Where are the rest wasted?
+
+The only other logical gate is `gaussian_depth_idx > last_contributor`. Recall that we track `n_contrib` during the forward pass to know the deepest gaussian to have impacted a given pixel. For some warps, it's possible that all gaussians are too deep.
+
+Conceptually, there is a visual example where this certainly is the case. Consider a complex scene blocked by a wall directly in front of the camera. While the scene is generally invisible, we still compute gradients w.r.t its gaussians. They'll have no impact, and we can safely ignore them using warp-level aggregation:
+```
+__shared__ int s_last_contributor;
+if (tid == 0) s_last_contributor = 0;
+__syncthreads();
+atomicMax(&s_last_contributor, last_contributor);
+__syncthreads();
+num_todo = min(num_todo, s_last_contributor);
+```
+This asks: what is the deepest gaussian that impacts *any* pixel in the tile? If you're deeper than that, we'll ignore you. This change provides only a small speedup, but is mostly for correctness and is relatively free. This ends up removing `1,492,600 warp-gaussian` pairs during the first condition of the loop. The remaining just under 50% are far trickier to remove, since it's a property of the tile-based algorithm. And, they'll provide little speedup. num_todo averages `1119.8 gaussians`, while the new block max average `1033.8 gaussians`.
+
+All told:
+
+| backward version | duplicates | warp-gaussian pairs visited | pairs past gate 1 | gradients written | `render_gaussians_backward` | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 2,436,080 | 19,439,224 | 16,645,355 | 3,127,661 | 8.52 ms | 1.00x |
+| + cutoff | 2,436,080 | 17,946,624 | 16,645,356 | 3,129,589 | 8.18 ms | 1.04x |
+| + footprint | 1,338,366 | 10,670,992 | 9,143,436 | 3,130,444 | 7.35 ms | 1.16x |
+| + footprint + cutoff | 1,338,366 | 9,884,720 | 9,143,403 | 3,132,371 | 7.15 ms | 1.19x |
