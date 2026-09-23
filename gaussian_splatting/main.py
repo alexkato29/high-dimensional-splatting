@@ -149,7 +149,7 @@ def train(args: argparse.Namespace) -> None:
 	params = TrainingParams()
 	params.iterations = args.iterations
 	params.eval_interval = args.eval_interval
-	optimizer = torch.optim.Adam(model.get_optimizer_params(params, dataset.extent), eps=1e-15)
+	optimizer = torch.optim.Adam(model.get_optimizer_params(params, dataset.extent), eps=1e-15, fused=True)
 
 	output_dir = args.output or Path("outputs") / f"training_{int(time.time())}"
 	output_dir.mkdir(parents=True, exist_ok=True)
