@@ -2,53 +2,42 @@
 
 A minimal implementation of [3D Gaussian Splatting for Real-Time Radiance Field Rendering](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) built from the ground up with custom CUDA kernels.
 
+![Inria 3DGS, gsplat and ours on three held out Truck views after 5,000 iterations](docs/truck_5k_grid.png)
+
 ## Overview
 
 This project implements the core 3DGS rasterization algorithm entirely from scratch, including:
 - Custom CUDA kernels for tile-based gaussian projection and rendering
 - Differentiable rasterizer with PyTorch bindings
 - Training pipeline with COLMAP dataset integration
-- Comprehensive unit tests for mathematical correctness
 
-## Technical Implementation
+## Performance
 
-### Custom CUDA Rasterizer
-The rasterizer (`src/gaussian_splatting/rasterizer/forward.cu`) implements:
+Measured on the Tanks and Temples Truck scene (979x546), trained for 5,000 iterations on one NVIDIA L4 GPU.
 
-1. **Gaussian Projection**: Projects 3D gaussians to 2D screen space
-   - Pinhole camera projection with covariance matrix transformation
-   - Quaternion-based rotation handling
-   - Frustum and depth culling
+| | mine | Inria 3DGS | `gsplat` 1.5.3 |
+|---|---|---|---|
+| Iterations | 5,000 | 5,000 | 5,000 |
+| Gaussians | 1,176,416 | 1,481,689 | 3,414,025 |
+| Train wall time | 130 s | 296 s | 680 s |
+| Test PSNR | 23.48 dB | 23.51 dB | 23.41 dB |
+| Render, median of 500 | 4.62 ms | 11.66 ms | 20.25 ms |
+| Render ms per million gaussians | **3.93** | 7.87 | 5.93 |
 
-2. **Tile-Based Rendering**: Optimizes rendering through spatial partitioning
-   - Computes tile coverage per gaussian
-   - Duplicates gaussians across tiles using prefix sum
-   - Radix sorts by (tile_id, depth) for front-to-back rendering
+This implementation considerably beats the original implementation on performance, and does beat `gsplat`. If I run my learned model through `gsplat`'s pipeline and `gsplat`'s model through mine:
 
-3. **Alpha Blending**: Renders gaussians with proper compositing
-   - Evaluates 2D gaussian weights per pixel
-   - Alpha compositing with early ray termination
+| Model | Gaussians | mine | `gsplat` | mine faster by |
+|---|---|---|---|---|
+| mine | 1,176,416 | 4.45 ms | 7.36 ms | **1.65x** |
+| `gsplat` | 3,414,025 | 12.07 ms | 20.20 ms | **1.67x** |
 
-### Architecture
-```
-src/
-├── gaussian_splatting/
-│   ├── rasterizer/
-│   │   ├── forward.cu          # CUDA kernels
-│   │   ├── bindings.cpp        # PyTorch bindings
-│   │   └── helpers.h           # GPU math utilities
-│   ├── utils/
-│   │   ├── dataset.py          # COLMAP data loading
-│   │   └── gaussian.py         # Gaussian model & parameters
-│   ├── config.py               # Training hyperparameters
-│   └── main.py                 # Training loop
-```
+Note: this comparison was run with all of the fancy `gsplat` features (antialiasing, alternative densification strategies, etc.) turned off. It's technically doing the same render, but this also isn't fully a fair comparison. This is a particular scenario on a GPU that I profiled specifically. `gsplat` is a more flexible library that supports different camera models, distributed training, more complex rendering options, etc. While mine is faster in this particular instance, it does not support any of the generalizations.
 
 ## Usage
 
 ```bash
 poetry install
-python src/gaussian_splatting/main.py path/to/colmap/scene
+poetry run python -m gaussian_splatting.main path/to/colmap/scene
 ```
 
 **Dataset Structure:**
