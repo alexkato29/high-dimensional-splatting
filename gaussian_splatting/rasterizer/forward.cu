@@ -358,6 +358,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 			   cudaMemcpyDeviceToHost);
 	int total_duplicates = last_offset + last_tiles_touched;
 
+	debug_print_duplicates(num_gaussians, num_tiles_x, num_tiles_y, total_duplicates);
+
 	if (total_duplicates == 0) {
 		return {background.reshape({1, 1, 3}).expand({image_height, image_width, 3}).contiguous(),
 				torch::ones({image_height, image_width}, f32),

@@ -83,10 +83,11 @@ class ProjectGaussians(torch.autograd.Function):
 		from gaussian_splatting.rasterizer import _get_rasterizer
 
 		means, scales, quats, world_to_camera = ctx.saved_tensors
-		grads = _get_rasterizer().project_gaussians_backward(
-			grad_means2D.contiguous(), grad_conics.contiguous(), means, scales, quats,
-			world_to_camera, *ctx.camera, NEAR_PLANE, LOW_PASS, JACOBIAN_FOV_SCALE
-		)
+		with torch.cuda.nvtx.range("project_backward"):
+			grads = _get_rasterizer().project_gaussians_backward(
+				grad_means2D.contiguous(), grad_conics.contiguous(), means, scales, quats,
+				world_to_camera, *ctx.camera, NEAR_PLANE, LOW_PASS, JACOBIAN_FOV_SCALE
+			)
 		return (*grads, None, None, None, None, None, None, None)
 
 

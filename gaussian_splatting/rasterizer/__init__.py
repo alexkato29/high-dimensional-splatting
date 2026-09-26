@@ -115,19 +115,20 @@ class RasterizeGaussians(torch.autograd.Function):
 		(means2D, conic, color_opacity, values_sorted, tile_ranges,
 		 final_transmittance, n_contrib, background) = ctx.saved_tensors
 		width, height = ctx.image_size
-		grad_means2D, grad_conics, grad_colors, grad_opacities = _get_rasterizer().rasterize_backward(
-			grad_image.contiguous(),
-			means2D,
-			conic,
-			color_opacity,
-			values_sorted,
-			tile_ranges,
-			final_transmittance,
-			n_contrib,
-			background,
-			width,
-			height
-		)
+		with torch.cuda.nvtx.range("rasterize_backward"):
+			grad_means2D, grad_conics, grad_colors, grad_opacities = _get_rasterizer().rasterize_backward(
+				grad_image.contiguous(),
+				means2D,
+				conic,
+				color_opacity,
+				values_sorted,
+				tile_ranges,
+				final_transmittance,
+				n_contrib,
+				background,
+				width,
+				height
+			)
 		return grad_means2D, None, None, grad_conics, grad_colors, grad_opacities, None, None, None
 
 

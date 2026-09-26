@@ -63,9 +63,10 @@ class EvalSH(torch.autograd.Function):
 			Gradients for sh_dc, sh_rest and dirs, and None for the degree.
 		"""
 		sh_dc, sh_rest, dirs = ctx.saved_tensors
-		grad_dc, grad_rest, grad_dirs = _get_rasterizer().eval_sh_backward(
-			grad_rgb.contiguous(), sh_dc, sh_rest, dirs, ctx.degree
-		)
+		with torch.cuda.nvtx.range("sh_backward"):
+			grad_dc, grad_rest, grad_dirs = _get_rasterizer().eval_sh_backward(
+				grad_rgb.contiguous(), sh_dc, sh_rest, dirs, ctx.degree
+			)
 		return grad_dc, grad_rest, grad_dirs, None
 
 
