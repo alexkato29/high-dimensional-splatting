@@ -1,12 +1,12 @@
 # Rasterizer Design Notes
 
-Per chunk of the program, I explain an optimization, how I found it, how I addressed it, and what it did. The number is the order in which they occurred.
+Per chunk of the program, I explain an optimization, how I found it, how I addressed it, and what it did. The prefix is the commit the optimization landed in.
 
 ## Forward Pass
 
 ### Project Gaussians
 
-##### (1) Understand the shape of your matrices
+##### (`09b7b3c`) Understand the shape of your matrices
 I noticed that this part of the pass was far and away the longest. We were calling 3 batched matmuls of shapes like [1.1M, 3, 3]. That is a ridiculously bad shape for cuBLAS... The `ampere_sgemm_128x128_nt` kernels were taking `~3.4ms` each. Sounds fast, but when we think about the work:
 - On the L4, max of 65536 matrices per BMM
 - 3.4ms / 65536 matrices = ~52ns per 3x3 multiply
@@ -14,20 +14,20 @@ I noticed that this part of the pass was far and away the longest. We were calli
 
 Abysmal ratio. I swapped matmuls for hardcoded expressions with Claude and saw a $\times3$ speedup!
 
-##### (2) Don't repeat work
+##### (`4c92592`) Don't repeat work
 I saw `aten::inverse` was taking `~18.3ms` per forward pass. Where is an inverse computed?? Turns out, once:
 ```
 @property
 def center(self) -> torch.Tensor:
     return self.world_to_camera.inverse()[:3, 3]
 ```
-This property recomputes the camera center every time called. But, a camera's center *never* changes. This is a complete waste of time. Plus, from optimization (1), you can imagine that the kernel dispatched by torch to take the inverse of a `4x4` matrix is going to be all overhead.
+This property recomputes the camera center every time called. But, a camera's center *never* changes. This is a complete waste of time. Plus, from optimization `09b7b3c`, you can imagine that the kernel dispatched by torch to take the inverse of a `4x4` matrix is going to be all overhead.
 
 Though, the inverse wasn't even a slow target. I realized I was looking at the CPU line (`CUDA API`) which was actually just stuck in a barrier synchronization (`cudaStreamSynchronize`). The CPU is waiting on a value, but the GPU is so busy that I can revisit these syncs.
 
 ### Spherical Harmonics
 
-##### (2) PyTorch isn't all magic
+##### (`247e65c`, `d64a22a`) PyTorch isn't all magic
 For large matrix multiplies, it's hard to beat torch. But, there are some things eager-mode PyTorch genuinely wasn't designed for. Spherical harmonics is an excellent example.
 
 To perform spherical harmonics, we must perform tons of tiny computations on lots of data. All in, ~49 multiplies and subtracts across `N` gaussians. In eager-mode, torch's own docs say:
@@ -57,7 +57,7 @@ I ended up pursuing (2), because `torch.compile` can't easily handle varying par
 
 ### Forward render
 
-##### Parallelize where it matters (3)
+##### (`a221083`) Parallelize where it matters
 
 The original authors cleverly batch gaussians into tiles to make rendering faster. To achieve this, a kernel `duplicate_gaussians` must makes $N_g$ copies of each gaussian in memory, where $N_g$ is the number of tiles a given gaussian $g$ appears in.
 
@@ -76,7 +76,7 @@ To address both, I rewrote the algorithm around coalescing output writes (with t
 
 ## Backward Pass
 
-##### (3) Atomic operations don't cleanly stack
+##### (`88b6f90`) Atomic operations don't cleanly stack
 Every thread in the backward pass computes gradients of a different pixel w.r.t a particular gaussian. When it's time to accumulate gradients via `atomicAdd(&grad_colors[g * 3 + 0], grad_color_x)`, the atomic property fortunately prevents race conditions in the memory writes! But, rather unfortunately, it does so by queueing memory write requests.
 
 When all 256 threads in the block at roughly the same time call `atomicAdd` on the same gaussian `g`, the L2 slice owning that memory address will have to queue each write to guarantee the atomic property. That leads to very long memory ops. Notably:
@@ -138,7 +138,7 @@ cycles measured:   8,944,626 / 26,214,542 = 0.3412     (0.1% off)
 ```
 
 
-##### (4) Relieving SMEM pressure
+##### (`2a9faa2`) Relieving SMEM pressure
 We decreased atomic operations, but it wasn't free...
 ```
 Compute (SM) Throughput [%]	89.49
@@ -148,7 +148,7 @@ Mem Pipes Busy [%]	89.49
 Now, for some reason, memory pipes are limiting our overall throughput. Okay... well what is a memory pipe and why is our's busy? From [Nvidia](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#memory-workload-analysis):
 > Memory can become a limiting factor for the overall kernel performance when fully utilizing the involved hardware units (Mem Busy), exhausting the available communication bandwidth between those units (Max Bandwidth), or by reaching the maximum throughput of issuing memory instructions (Mem Pipes Busy).
 
-We have "reached the maximum throughput of issuing memory instructions". Intuitively, a memory instruction is probably just global/shared memory read/write instructions. But... something is suspicious. In optimization (3), we did not change the # of issued memory instructions at all and only saw a `2.93x` speedup. Let's do the math:
+We have "reached the maximum throughput of issuing memory instructions". Intuitively, a memory instruction is probably just global/shared memory read/write instructions. But... something is suspicious. In optimization `88b6f90`, we did not change the # of issued memory instructions at all and only saw a `2.93x` speedup. Let's do the math:
 
 | counter | what it counts | all lanes | warp reduction |
 | --- | --- | ---: | ---: |
@@ -234,7 +234,7 @@ Mem Pipes Busy [%]	83.50
 ```
 Much better, though it doesn't match the theoretical. That is because, if you work it out, the atomic lanes per gaussian at 3 shuffles really works out to be 2.55, not the theoretical 4.
 
-##### (5) Set and verify kernels against expectations
+##### (`7955c73`, `8cd7dd3`) Set and verify kernels against expectations
 GPU kernels have a small footprint, but they're also deceptively complex. Both mean it's increasingly important to be in tune not just with what every line *should* do, but what every line *actually* does.
 
 Take our backward pass. On profile, it showed `l1tex__t_requests_pipe_lsu_mem_global_op_red.sum: 28,148,949`. The reduction sum is just `atomicAdd`, so it's writing ~28M gradients. Notice from the code block:
