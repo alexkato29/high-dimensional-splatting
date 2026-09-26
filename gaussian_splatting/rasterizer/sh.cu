@@ -58,9 +58,14 @@ __device__ inline void basis_grad(float x, float y, float z, int k, float* bx, f
 
 
 __global__ void eval_sh_forward(int n, int k, const float* sh_dc, const float* sh_rest,
-								const float3* dirs, float* rgb) {
+								const float3* dirs, const float* radii, float* rgb) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n) return;
+
+	if (!(radii[i] > 0.0f)) {
+		rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0.0f;
+		return;
+	}
 
 	float b[16];
 	float3 d = dirs[i];
@@ -77,9 +82,12 @@ __global__ void eval_sh_forward(int n, int k, const float* sh_dc, const float* s
 
 
 __global__ void eval_sh_backward(int n, int k, const float* sh_dc, const float* sh_rest, const float3* dirs,
-								 const float* grad_rgb, float* grad_dc, float* grad_rest, float3* grad_dirs) {
+								 const float* radii, const float* grad_rgb, float* grad_dc, float* grad_rest,
+								 float3* grad_dirs) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n) return;
+
+	if (!(radii[i] > 0.0f)) return;
 
 	float b[16], bx[16], by[16], bz[16];
 	float3 d = dirs[i];
@@ -113,13 +121,14 @@ __global__ void eval_sh_backward(int n, int k, const float* sh_dc, const float* 
 }
 
 
-torch::Tensor eval_sh(torch::Tensor sh_dc, torch::Tensor sh_rest, torch::Tensor dirs, int degree) {
+torch::Tensor eval_sh(torch::Tensor sh_dc, torch::Tensor sh_rest, torch::Tensor dirs, int degree,
+					  torch::Tensor radii) {
 	int n = sh_dc.size(0);
 	torch::Tensor rgb = torch::empty({n, 3}, sh_dc.options());
 	if (n > 0) {
 		eval_sh_forward<<<(n + 255) / 256, 256>>>(
 			n, (degree + 1) * (degree + 1), sh_dc.data_ptr<float>(), sh_rest.data_ptr<float>(),
-			reinterpret_cast<const float3*>(dirs.data_ptr<float>()), rgb.data_ptr<float>());
+			reinterpret_cast<const float3*>(dirs.data_ptr<float>()), radii.data_ptr<float>(), rgb.data_ptr<float>());
 		check_cuda_error("eval_sh_forward");
 	}
 	return rgb;
@@ -127,16 +136,17 @@ torch::Tensor eval_sh(torch::Tensor sh_dc, torch::Tensor sh_rest, torch::Tensor 
 
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> eval_sh_backward_host(
-	torch::Tensor grad_rgb, torch::Tensor sh_dc, torch::Tensor sh_rest, torch::Tensor dirs, int degree
+	torch::Tensor grad_rgb, torch::Tensor sh_dc, torch::Tensor sh_rest, torch::Tensor dirs, int degree,
+	torch::Tensor radii
 ) {
 	int n = sh_dc.size(0);
-	torch::Tensor grad_dc = torch::empty_like(sh_dc);
-	torch::Tensor grad_rest = torch::empty_like(sh_rest);
-	torch::Tensor grad_dirs = torch::empty_like(dirs);
+	torch::Tensor grad_dc = torch::zeros_like(sh_dc);
+	torch::Tensor grad_rest = torch::zeros_like(sh_rest);
+	torch::Tensor grad_dirs = torch::zeros_like(dirs);
 	if (n > 0) {
 		eval_sh_backward<<<(n + 255) / 256, 256>>>(
 			n, (degree + 1) * (degree + 1), sh_dc.data_ptr<float>(), sh_rest.data_ptr<float>(),
-			reinterpret_cast<const float3*>(dirs.data_ptr<float>()), grad_rgb.data_ptr<float>(),
+			reinterpret_cast<const float3*>(dirs.data_ptr<float>()), radii.data_ptr<float>(), grad_rgb.data_ptr<float>(),
 			grad_dc.data_ptr<float>(), grad_rest.data_ptr<float>(),
 			reinterpret_cast<float3*>(grad_dirs.data_ptr<float>()));
 		check_cuda_error("eval_sh_backward");

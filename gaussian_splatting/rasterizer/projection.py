@@ -26,13 +26,14 @@ class ProjectGaussians(torch.autograd.Function):
 	"""Projects 3D gaussians into the image plane as 2D gaussians, in one CUDA kernel.
 
 	Call it through project_gaussians with means [N, 3], activated scales [N, 3], unit quats [N, 4],
-	the [4, 4] world to camera transform, the intrinsics and the image size. It returns means2D
-	[N, 2] in pixels, depths [N] used only to sort, radii [N] which are 0 for culled gaussians and
-	carry no gradient, and conics [N, 3] as the inverse 2D covariance (xx, xy, yy).
+	activated opacities [N, 1], the [4, 4] world to camera transform, the intrinsics and the image
+	size. It returns means2D [N, 2] in pixels, depths [N] used only to sort, radii [N] which are 0 for
+	every gaussian that will not render and carry no gradient, and conics [N, 3] as the inverse 2D
+	covariance (xx, xy, yy).
 	"""
 
 	@staticmethod
-	def forward(ctx, means, scales, quats, world_to_camera, fx, fy, cx, cy, width, height):
+	def forward(ctx, means, scales, quats, opacities, world_to_camera, fx, fy, cx, cy, width, height):
 		"""Projects the gaussians and saves the inputs the backward recomputes from.
 
 		Args:
@@ -40,6 +41,7 @@ class ProjectGaussians(torch.autograd.Function):
 			means: [N, 3] gaussian centers in world space.
 			scales: [N, 3] per axis standard deviations, already activated.
 			quats: [N, 4] unit quaternions ordered (w, x, y, z).
+			opacities: [N, 1] in (0, 1), used only to cull gaussians too faint to ever blend.
 			world_to_camera: [4, 4] world to camera transform.
 			fx: Horizontal focal length in pixels.
 			fy: Vertical focal length in pixels.
@@ -55,7 +57,7 @@ class ProjectGaussians(torch.autograd.Function):
 
 		means, scales, quats = means.contiguous(), scales.contiguous(), quats.contiguous()
 		outputs = _get_rasterizer().project_gaussians(
-			means, scales, quats, world_to_camera, fx, fy, cx, cy, width, height,
+			means, scales, quats, opacities.detach(), world_to_camera, fx, fy, cx, cy, width, height,
 			NEAR_PLANE, LOW_PASS, JACOBIAN_FOV_SCALE
 		)
 		ctx.save_for_backward(means, scales, quats, world_to_camera)
@@ -78,7 +80,7 @@ class ProjectGaussians(torch.autograd.Function):
 			grad_conics: [N, 3] gradient of the loss with respect to the conics.
 
 		Returns:
-			Gradients for means, scales and quats, and None for the camera arguments.
+			Gradients for means, scales and quats, and None for the opacities and the camera arguments.
 		"""
 		from gaussian_splatting.rasterizer import _get_rasterizer
 
@@ -88,7 +90,7 @@ class ProjectGaussians(torch.autograd.Function):
 				grad_means2D.contiguous(), grad_conics.contiguous(), means, scales, quats,
 				world_to_camera, *ctx.camera, NEAR_PLANE, LOW_PASS, JACOBIAN_FOV_SCALE
 			)
-		return (*grads, None, None, None, None, None, None, None)
+		return (*grads, None, None, None, None, None, None, None, None)
 
 
 project_gaussians = ProjectGaussians.apply

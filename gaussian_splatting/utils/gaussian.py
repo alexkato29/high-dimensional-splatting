@@ -95,17 +95,18 @@ class GaussianModel:
 		"""
 		return torch.sigmoid(self.params["opacities"])
 
-	def colors(self, camera_center: torch.Tensor) -> torch.Tensor:
+	def colors(self, camera_center: torch.Tensor, radii: torch.Tensor) -> torch.Tensor:
 		"""Evaluates the spherical harmonics for one viewpoint.
 
 		Args:
 			camera_center: [3] camera position in world space.
+			radii: [N] projection radii for this view, 0 for the culled gaussians it skips.
 
 		Returns:
-			[N, 3] RGB of every gaussian as seen from camera_center.
+			[N, 3] RGB of every gaussian as seen from camera_center, zero for culled ones.
 		"""
 		dirs = F.normalize(self.means - camera_center, dim=-1)
-		return eval_sh(self.params["sh_dc"], self.params["sh_rest"], dirs, self.active_sh_degree)
+		return eval_sh(self.params["sh_dc"], self.params["sh_rest"], dirs, self.active_sh_degree, radii)
 
 	def get_optimizer_params(self, params: TrainingParams, extent: float) -> list[dict[str, Any]]:
 		"""Builds the Adam parameter groups, one per tensor so each gets its own learning rate.

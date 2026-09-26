@@ -28,12 +28,14 @@ class EvalSH(torch.autograd.Function):
 
 	One thread per gaussian evaluates the basis functions for its viewing direction and mixes the
 	weights, so no basis or coefficient tensor is ever materialized. Call it through eval_sh with
-	sh_dc [N, 1, 3], sh_rest [N, 15, 3], dirs [N, 3] and the highest degree to evaluate, and it
-	returns [N, 3] RGB offset by 0.5 and clamped to non-negative.
+	sh_dc [N, 1, 3], sh_rest [N, 15, 3], dirs [N, 3], the highest degree to evaluate and the
+	projection radii, and it returns [N, 3] RGB offset by 0.5 and clamped to non-negative. Culled
+	gaussians are skipped and get a color and gradients of zero.
 	"""
 
 	@staticmethod
-	def forward(ctx, sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degree: int) -> torch.Tensor:
+	def forward(ctx, sh_dc: torch.Tensor, sh_rest: torch.Tensor, dirs: torch.Tensor, degree: int,
+				radii: torch.Tensor) -> torch.Tensor:
 		"""Evaluates the colors and saves the inputs the backward needs.
 
 		Args:
@@ -42,17 +44,18 @@ class EvalSH(torch.autograd.Function):
 			sh_rest: [N, 15, 3] weights for degrees 1 through 3, contiguous.
 			dirs: [N, 3] unit vectors from the camera to each gaussian, contiguous.
 			degree: Highest degree to evaluate.
+			radii: [N] projection radii, 0 for culled gaussians.
 
 		Returns:
 			[N, 3] RGB.
 		"""
-		sh_dc, sh_rest, dirs = sh_dc.contiguous(), sh_rest.contiguous(), dirs.contiguous()
-		ctx.save_for_backward(sh_dc, sh_rest, dirs)
+		sh_dc, sh_rest, dirs, radii = sh_dc.contiguous(), sh_rest.contiguous(), dirs.contiguous(), radii.contiguous()
+		ctx.save_for_backward(sh_dc, sh_rest, dirs, radii)
 		ctx.degree = degree
-		return _get_rasterizer().eval_sh(sh_dc, sh_rest, dirs, degree)
+		return _get_rasterizer().eval_sh(sh_dc, sh_rest, dirs, degree, radii)
 
 	@staticmethod
-	def backward(ctx, grad_rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+	def backward(ctx, grad_rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
 		"""Recomputes the basis and scatters the gradients back to the weights and the directions.
 
 		Args:
@@ -60,14 +63,14 @@ class EvalSH(torch.autograd.Function):
 			grad_rgb: [N, 3] gradient of the loss with respect to the colors.
 
 		Returns:
-			Gradients for sh_dc, sh_rest and dirs, and None for the degree.
+			Gradients for sh_dc, sh_rest and dirs, and None for the degree and the radii.
 		"""
-		sh_dc, sh_rest, dirs = ctx.saved_tensors
+		sh_dc, sh_rest, dirs, radii = ctx.saved_tensors
 		with torch.cuda.nvtx.range("sh_backward"):
 			grad_dc, grad_rest, grad_dirs = _get_rasterizer().eval_sh_backward(
-				grad_rgb.contiguous(), sh_dc, sh_rest, dirs, ctx.degree
+				grad_rgb.contiguous(), sh_dc, sh_rest, dirs, ctx.degree, radii
 			)
-		return grad_dc, grad_rest, grad_dirs, None
+		return grad_dc, grad_rest, grad_dirs, None, None
 
 
 eval_sh = EvalSH.apply

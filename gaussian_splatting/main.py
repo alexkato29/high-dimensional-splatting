@@ -26,10 +26,10 @@ def render(camera: Camera, gaussians: GaussianModel) -> tuple[torch.Tensor, torc
 			image: [H, W, 3] rendered image.
 			means2D: [N, 2] projected centers, whose gradient drives densification and which
 				therefore retains its grad.
-			radii: [N] footprint radii in pixels, 0 for gaussians this view culled.
+			radii: [N] footprint radii in pixels, 0 for every gaussian this view does not render.
 	"""
 	means2D, depths, radii, conics = project_gaussians(
-		gaussians.means, gaussians.scales, gaussians.quats, camera.world_to_camera,
+		gaussians.means, gaussians.scales, gaussians.quats, gaussians.opacities, camera.world_to_camera,
 		camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height
 	)
 	# Since means2D is not a named parameter in the optimization parameters, its gradient is freed
@@ -37,7 +37,7 @@ def render(camera: Camera, gaussians: GaussianModel) -> tuple[torch.Tensor, torc
 	if means2D.requires_grad:
 		means2D.retain_grad()
 	image = rasterize(
-		means2D, depths, radii, conics, gaussians.colors(camera.center), gaussians.opacities,
+		means2D, depths, radii, conics, gaussians.colors(camera.center, radii), gaussians.opacities,
 		camera.width, camera.height
 	)
 	return image, means2D, radii

@@ -30,14 +30,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("sh_dc"),
 		py::arg("sh_rest"),
 		py::arg("dirs"),
-		py::arg("degree")
+		py::arg("degree"),
+		py::arg("radii")
 	);
 	m.def("eval_sh_backward", &eval_sh_backward_host, "Spherical harmonics colors backward (CUDA)",
 		py::arg("grad_rgb"),
 		py::arg("sh_dc"),
 		py::arg("sh_rest"),
 		py::arg("dirs"),
-		py::arg("degree")
+		py::arg("degree"),
+		py::arg("radii")
 	);
 	m.def("project_gaussians", &project_gaussians, "Project gaussians into the image plane (CUDA)");
 	m.def("project_gaussians_backward", &project_gaussians_backward, "Projection backward (CUDA)");

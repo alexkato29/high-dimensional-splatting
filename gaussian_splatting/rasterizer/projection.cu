@@ -78,8 +78,8 @@ __device__ inline void project(const Camera& cam, const float* world_to_camera, 
 
 
 __global__ void project_forward(int n, Camera cam, const float* world_to_camera, const float* means,
-								const float* scales, const float* quats, float* means2D, float* depths,
-								float* radii, float* conics) {
+								const float* scales, const float* quats, const float* opacities, float* means2D,
+								float* depths, float* radii, float* conics) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n) return;
 
@@ -93,15 +93,20 @@ __global__ void project_forward(int n, Camera cam, const float* world_to_camera,
 	depths[i] = g.p[2];
 
 	float scale_inv = g.det > 0.0f ? 1.0f / g.det : 1.0f;
-	conics[i * 3 + 0] = g.c * scale_inv;
-	conics[i * 3 + 1] = -g.b * scale_inv;
-	conics[i * 3 + 2] = g.a * scale_inv;
+	float a_conic = g.c * scale_inv;
+	float b_conic = -g.b * scale_inv;
+	float c_conic = g.a * scale_inv;
+	conics[i * 3 + 0] = a_conic;
+	conics[i * 3 + 1] = b_conic;
+	conics[i * 3 + 2] = c_conic;
 
 	float trace = g.a + g.c;
 	float radius = 3.0f * sqrtf(0.5f * (trace + sqrtf(fmaxf(trace * trace - 4.0f * g.det, 0.0f))));
+	int2 tile_min, tile_size;
 	bool visible = !g.behind && g.det > 0.0f
-		&& u - radius <= cam.width && u + radius >= 0.0f
-		&& v - radius <= cam.height && v + radius >= 0.0f;
+		&& tile_rect(make_float2(u, v), a_conic, b_conic, c_conic, opacities[i],
+					 (cam.width + TILE_SIZE - 1) / TILE_SIZE, (cam.height + TILE_SIZE - 1) / TILE_SIZE,
+					 tile_min, tile_size);
 	radii[i] = visible ? radius : 0.0f;
 }
 
@@ -203,13 +208,14 @@ static Camera make_camera(float fx, float fy, float cx, float cy, int width, int
 
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> project_gaussians(
-	torch::Tensor means, torch::Tensor scales, torch::Tensor quats, torch::Tensor world_to_camera,
-	float fx, float fy, float cx, float cy, int width, int height,
+	torch::Tensor means, torch::Tensor scales, torch::Tensor quats, torch::Tensor opacities,
+	torch::Tensor world_to_camera, float fx, float fy, float cx, float cy, int width, int height,
 	float near_plane, float low_pass, float fov_scale
 ) {
 	int n = means.size(0);
 	Camera cam = make_camera(fx, fy, cx, cy, width, height, near_plane, low_pass, fov_scale);
 	torch::Tensor pose = world_to_camera.contiguous();
+	torch::Tensor opacity = opacities.contiguous();
 	torch::Tensor means2D = torch::empty({n, 2}, means.options());
 	torch::Tensor depths = torch::empty({n}, means.options());
 	torch::Tensor radii = torch::empty({n}, means.options());
@@ -217,7 +223,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> project_g
 	if (n > 0) {
 		project_forward<<<(n + 255) / 256, 256>>>(
 			n, cam, pose.data_ptr<float>(), means.data_ptr<float>(), scales.data_ptr<float>(), quats.data_ptr<float>(),
-			means2D.data_ptr<float>(), depths.data_ptr<float>(), radii.data_ptr<float>(),
+			opacity.data_ptr<float>(), means2D.data_ptr<float>(), depths.data_ptr<float>(), radii.data_ptr<float>(),
 			conics.data_ptr<float>());
 		check_cuda_error("project_forward");
 	}

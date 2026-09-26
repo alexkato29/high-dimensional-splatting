@@ -31,7 +31,8 @@ torch::Tensor eval_sh(
 	torch::Tensor sh_dc,
 	torch::Tensor sh_rest,
 	torch::Tensor dirs,
-	int degree
+	int degree,
+	torch::Tensor radii
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> eval_sh_backward_host(
@@ -39,13 +40,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> eval_sh_backward_host(
 	torch::Tensor sh_dc,
 	torch::Tensor sh_rest,
 	torch::Tensor dirs,
-	int degree
+	int degree,
+	torch::Tensor radii
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> project_gaussians(
 	torch::Tensor means,
 	torch::Tensor scales,
 	torch::Tensor quats,
+	torch::Tensor opacities,
 	torch::Tensor world_to_camera,
 	float fx, float fy, float cx, float cy,
 	int width, int height,
