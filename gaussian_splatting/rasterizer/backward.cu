@@ -8,6 +8,29 @@ __device__ inline float warp_octet_sum(float v) {
 	return v;
 }
 
+// Sums 8 values over the 8 lanes of an octet, leaving lane k with the total of v[k]. Each level keeps
+// half the list and sends the partner the half it keeps, so 7 shuffles instead of 24.
+__device__ inline float octet_reduce_scatter(float v[8], int lane) {
+	bool hi = lane & 4;
+	#pragma unroll
+	for (int i = 0; i < 4; i++) {
+		float send = hi ? v[i] : v[i + 4];
+		float keep = hi ? v[i + 4] : v[i];
+		v[i] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
+	}
+	hi = lane & 2;
+	#pragma unroll
+	for (int i = 0; i < 2; i++) {
+		float send = hi ? v[i] : v[i + 2];
+		float keep = hi ? v[i + 2] : v[i];
+		v[i] = keep + __shfl_xor_sync(0xffffffffu, send, 2);
+	}
+	hi = lane & 1;
+	float send = hi ? v[0] : v[1];
+	float keep = hi ? v[1] : v[0];
+	return keep + __shfl_xor_sync(0xffffffffu, send, 1);
+}
+
 
 __global__ void render_gaussians_backward(
 	const uint2* tile_ranges,
@@ -140,28 +163,24 @@ __global__ void render_gaussians_backward(
 
 			unsigned int active = __ballot_sync(0xffffffffu, contributes);
 			if (active) {
-				float grad_color_x = warp_octet_sum(dL_dcolor * dL_dpixel.x);
-				float grad_color_y = warp_octet_sum(dL_dcolor * dL_dpixel.y);
-				float grad_color_z = warp_octet_sum(dL_dcolor * dL_dpixel.z);
-				float grad_opacity = warp_octet_sum(dL_dopacity);
-				float grad_mean_x = warp_octet_sum(dL_dmean2D.x);
-				float grad_mean_y = warp_octet_sum(dL_dmean2D.y);
-				float grad_conic_x = warp_octet_sum(dL_dconic.x);
-				float grad_conic_y = warp_octet_sum(dL_dconic.y);
+				float v[8] = {
+					dL_dcolor * dL_dpixel.x, dL_dcolor * dL_dpixel.y, dL_dcolor * dL_dpixel.z,
+					dL_dopacity,
+					dL_dmean2D.x, dL_dmean2D.y,
+					dL_dconic.x, dL_dconic.y};
+				float total = octet_reduce_scatter(v, tid);
 				float grad_conic_z = warp_octet_sum(dL_dconic.z);
 
-				if ((tid & 7) == 0 && ((active >> (tid & 31)) & 0xffu)) {
+				// Every lane of an octet holds a different finished gradient, so one RED writes all 8.
+				if ((active >> (tid & 24)) & 0xffu) {
 					int g = s_id[j];
-					// On an L4, there are no vectorized atomic instructions.
-					atomicAdd(&grad_colors[g * 3 + 0], grad_color_x);
-					atomicAdd(&grad_colors[g * 3 + 1], grad_color_y);
-					atomicAdd(&grad_colors[g * 3 + 2], grad_color_z);
-					atomicAdd(&grad_opacities[g], grad_opacity);
-					atomicAdd(&grad_means2D[g * 2 + 0], grad_mean_x);
-					atomicAdd(&grad_means2D[g * 2 + 1], grad_mean_y);
-					atomicAdd(&grad_conics[g * 3 + 0], grad_conic_x);
-					atomicAdd(&grad_conics[g * 3 + 1], grad_conic_y);
-					atomicAdd(&grad_conics[g * 3 + 2], grad_conic_z);
+					int k = tid & 7;
+					float* dst = k < 3 ? &grad_colors[g * 3 + k]
+							   : k == 3 ? &grad_opacities[g]
+							   : k < 6 ? &grad_means2D[g * 2 + (k - 4)]
+							   : &grad_conics[g * 3 + (k - 6)];
+					atomicAdd(dst, total);
+					if (k == 0) atomicAdd(&grad_conics[g * 3 + 2], grad_conic_z);
 				}
 			}
 		}
