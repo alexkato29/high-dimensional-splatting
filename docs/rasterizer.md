@@ -53,7 +53,53 @@ Neither holds new information, they're just copies rearranged so cuBLAS can take
 I first tried (1) to get more PyTorch practice, and the forward total time ~halved after doing this.
 I ended up pursuing (2), because `torch.compile` can't easily handle varying parameter shapes. Every densification/culling pass, we change `N`, so compilation wasn't the right call.
 
-### Forward Render
+### (`e014035`) Binding backward passes to autodiff has overhead
+By default, PyTorch's autodiff tracks every parameter for every gaussian. How many parameters is that? At ~1.18M gaussians:
+
+| parameter | weights per gaussian | total weights | gradient size (fp32) |
+| --- | ---: | ---: | ---: |
+| `means` | 3 | 3,547,791 | 14.2 MB |
+| `scales` | 3 | 3,547,791 | 14.2 MB |
+| `quats` | 4 | 4,730,388 | 18.9 MB |
+| `opacities` | 1 | 1,182,597 | 4.7 MB |
+| `sh_dc` | 3 | 3,547,791 | 14.2 MB |
+| `sh_rest` | 45 | 53,216,865 | 212.9 MB |
+| **total** | **59** | **69,773,223** | **279.1 MB** |
+
+Woah, 48 of the 59 gaussian parameters are solely from spherical harmonics. On its own, not bad. But we also wrote the backward pass for SH. How is torch actually accessing that gradient? We do so by:
+1. Allocating a zero array in device memory that is # SH params * 4 B per float32 * # of gaussians in size.
+2. Launching a kernel to compute the gradient and writing it to memory.
+3. Having the torch optimizer re-read this gradient tensor and apply the changes to itself.
+
+This is the general pattern for *any* self-written backward pass that wants to plug into the torch optimizer. And, normally that's fine and necessary. Recall the chain rule from calculus, it's common that gradients closer to the loss are inputs to gradients further from the loss. So, they must be stored.
+
+But, for spherical harmonics, this is not the case. No downstream gradients depend on it. It's ready to be used for an update and discarded as soon as it's created. No need to perform all the memory overhead in the way we do for other kernels, we can rewrite the backward to just apply the update via Adam directly. All told:
+
+| | before | after |
+| --- | ---: | ---: |
+| training step | 23.9 ms | 20.4 ms |
+| SH backward kernel (ncu) | 2.31 ms `eval_sh_backward` | 6.23 ms `eval_sh_backward_adam` (but also does Adam step) |
+| SH gradient zero fill | 227 MB | none |
+| SH gradient written to and read from DRAM | 227 MB each way | none |
+| weights per gaussian stepped by torch Adam | 59 | 11 |
+| DRAM traffic per SH weight | 36 B | 24 B |
+
+*Note:* that last row comes from the fact that, before, the update required:
+
+| step | reads | writes | bytes per SH weight |
+| --- | --- | --- | ---: |
+| `torch::zeros` on the gradient buffer | | grad | 4 |
+| `eval_sh_backward` | | grad | 4 |
+| torch fused Adam | param, grad, m, v | param, m, v | 28 |
+| **total** | | | **36** |
+
+But, after:
+
+| step | reads | writes | bytes per SH weight |
+| --- | --- | --- | ---: |
+| `eval_sh_backward_adam` (gradient stays in shared memory) | param, m, v | param, m, v | **24** |
+
+## Forward Render
 
 ### (`0fc4d38`) Parallelize where it matters
 
