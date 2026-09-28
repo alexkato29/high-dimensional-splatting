@@ -57,6 +57,8 @@ class GaussianModel:
 		self.max_sh_degree = max_sh_degree
 		self.active_sh_degree = 0
 		self.device = device
+		# When set, the SH backward steps sh_dc and sh_rest with this Adam itself instead of writing gradients.
+		self.sh_optimizer: torch.optim.Adam | None = None
 		self._reset_stats(n)
 
 	@property
@@ -106,7 +108,8 @@ class GaussianModel:
 			[N, 3] RGB of every gaussian as seen from camera_center, zero for culled ones.
 		"""
 		dirs = F.normalize(self.means - camera_center, dim=-1)
-		return eval_sh(self.params["sh_dc"], self.params["sh_rest"], dirs, self.active_sh_degree, radii)
+		return eval_sh(self.params["sh_dc"], self.params["sh_rest"], dirs, self.active_sh_degree, radii,
+					   self.sh_optimizer)
 
 	def get_optimizer_params(self, params: TrainingParams, extent: float) -> list[dict[str, Any]]:
 		"""Builds the Adam parameter groups, one per tensor so each gets its own learning rate.

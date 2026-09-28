@@ -33,14 +33,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("degree"),
 		py::arg("radii")
 	);
-	m.def("eval_sh_backward", &eval_sh_backward_host, "Spherical harmonics colors backward (CUDA)",
-		py::arg("grad_rgb"),
-		py::arg("sh_dc"),
-		py::arg("sh_rest"),
-		py::arg("dirs"),
-		py::arg("degree"),
-		py::arg("radii")
-	);
+	m.def("eval_sh_backward_adam", &eval_sh_backward_adam_host, "SH backward with Adam applied in place (CUDA)");
 	m.def("ssim_forward", &ssim_forward, "Fused SSIM map and partials (CUDA)");
 	m.def("ssim_backward", &ssim_backward, "Fused SSIM backward (CUDA)");
 	m.def("project_gaussians", &project_gaussians, "Project gaussians into the image plane (CUDA)");

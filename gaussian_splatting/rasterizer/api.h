@@ -35,13 +35,24 @@ torch::Tensor eval_sh(
 	torch::Tensor radii
 );
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> eval_sh_backward_host(
+torch::Tensor eval_sh_backward_adam_host(
 	torch::Tensor grad_rgb,
 	torch::Tensor sh_dc,
 	torch::Tensor sh_rest,
 	torch::Tensor dirs,
 	int degree,
-	torch::Tensor radii
+	torch::Tensor radii,
+	torch::Tensor m_dc,
+	torch::Tensor v_dc,
+	torch::Tensor m_rest,
+	torch::Tensor v_rest,
+	torch::Tensor step_dc,
+	torch::Tensor step_rest,
+	double lr_dc,
+	double lr_rest,
+	double beta1,
+	double beta2,
+	double eps
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> project_gaussians(
