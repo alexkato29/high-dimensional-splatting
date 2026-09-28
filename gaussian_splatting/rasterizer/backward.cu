@@ -8,8 +8,6 @@ __device__ inline float warp_octet_sum(float v) {
 	return v;
 }
 
-// Sums 8 values over the 8 lanes of an octet, leaving lane k with the total of v[k]. Each level keeps
-// half the list and sends the partner the half it keeps, so 7 shuffles instead of 24.
 __device__ inline float octet_reduce_scatter(float v[8], int lane) {
 	bool hi = lane & 4;
 	#pragma unroll
@@ -133,7 +131,9 @@ __global__ void render_gaussians_backward(
 				contributes = alpha >= MIN_ALPHA;
 
 				if (contributes) {
-					transmittance /= (1.0f - alpha);
+					// 1 - alpha is at least 0.01, so the fast reciprocal needs no IEEE division slow path.
+					float inv_one_minus_alpha = __fdividef(1.0f, 1.0f - alpha);
+					transmittance *= inv_one_minus_alpha;
 
 					accum_rec.x = last_alpha * last_color.x + (1.0f - last_alpha) * accum_rec.x;
 					accum_rec.y = last_alpha * last_color.y + (1.0f - last_alpha) * accum_rec.y;
@@ -144,7 +144,7 @@ __global__ void render_gaussians_backward(
 					float dL_dalpha = ((color.x - accum_rec.x) * dL_dpixel.x
 									 + (color.y - accum_rec.y) * dL_dpixel.y
 									 + (color.z - accum_rec.z) * dL_dpixel.z) * transmittance
-									- final_T / (1.0f - alpha) * dL_dfinal_T;
+									- final_T * inv_one_minus_alpha * dL_dfinal_T;
 
 					dL_dcolor = alpha * transmittance;
 
