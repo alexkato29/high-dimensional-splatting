@@ -41,6 +41,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("degree"),
 		py::arg("radii")
 	);
+	m.def("ssim_forward", &ssim_forward, "Fused SSIM map and partials (CUDA)");
+	m.def("ssim_backward", &ssim_backward, "Fused SSIM backward (CUDA)");
 	m.def("project_gaussians", &project_gaussians, "Project gaussians into the image plane (CUDA)");
 	m.def("project_gaussians_backward", &project_gaussians_backward, "Projection backward (CUDA)");
 }

@@ -27,6 +27,7 @@ def _get_rasterizer() -> Any:
 		str(current_dir / "backward.cu"),
 		str(current_dir / "sh.cu"),
 		str(current_dir / "projection.cu"),
+		str(current_dir / "ssim.cu"),
 		str(current_dir / "bindings.cpp")
 	]
 

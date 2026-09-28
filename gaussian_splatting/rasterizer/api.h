@@ -55,6 +55,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> project_g
 	float near_plane, float low_pass, float fov_scale
 );
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ssim_forward(
+	torch::Tensor rendered,
+	torch::Tensor gt
+);
+
+torch::Tensor ssim_backward(
+	torch::Tensor grad_mean,
+	torch::Tensor rendered,
+	torch::Tensor gt,
+	torch::Tensor d_mu,
+	torch::Tensor d_aa,
+	torch::Tensor d_ab
+);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> project_gaussians_backward(
 	torch::Tensor grad_means2D,
 	torch::Tensor grad_conics,

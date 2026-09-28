@@ -3,6 +3,8 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from gaussian_splatting.rasterizer import _get_rasterizer
+
 C1 = 0.01 ** 2
 C2 = 0.03 ** 2
 
@@ -52,6 +54,41 @@ def _window(size: int, sigma: float, device: torch.device, dtype: torch.dtype) -
 	return (g[:, None] * g[None, :]).expand(3, 1, size, size).contiguous()
 
 
+class FusedSSIM(torch.autograd.Function):
+	"""Autograd node for the CUDA SSIM, which fuses the blurs and the per pixel math."""
+
+	@staticmethod
+	def forward(ctx, rendered: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+		"""Computes mean SSIM and keeps the per pixel partials the backward pass blurs.
+
+		Args:
+			ctx: Autograd context the saved tensors are stashed on.
+			rendered: [H, W, 3] contiguous CUDA image in [0, 1].
+			gt: [H, W, 3] contiguous CUDA image in [0, 1].
+
+		Returns:
+			Scalar tensor holding the mean SSIM.
+		"""
+		ssim_map, d_mu, d_aa, d_ab = _get_rasterizer().ssim_forward(rendered, gt)
+		ctx.save_for_backward(rendered, gt, d_mu, d_aa, d_ab)
+		return ssim_map.mean()
+
+	@staticmethod
+	def backward(ctx, grad_mean: torch.Tensor) -> tuple[torch.Tensor, None]:
+		"""Blurs the saved partials back onto the rendered image.
+
+		Args:
+			ctx: Autograd context holding the tensors saved during the forward pass.
+			grad_mean: Scalar gradient of the loss with respect to the mean SSIM.
+
+		Returns:
+			The gradient for the rendered image, and None for the ground truth.
+		"""
+		rendered, gt, d_mu, d_aa, d_ab = ctx.saved_tensors
+		grad = _get_rasterizer().ssim_backward(grad_mean.reshape(1).contiguous(), rendered, gt, d_mu, d_aa, d_ab)
+		return grad, None
+
+
 def ssim(rendered: torch.Tensor, gt: torch.Tensor, size: int = 11, sigma: float = 1.5) -> torch.Tensor:
 	"""Structural similarity, comparing local means, variances and covariance per channel.
 
@@ -67,6 +104,9 @@ def ssim(rendered: torch.Tensor, gt: torch.Tensor, size: int = 11, sigma: float 
 	Returns:
 		Scalar tensor holding the mean SSIM over every pixel and channel, where 1 is identical.
 	"""
+	if rendered.is_cuda and rendered.dtype == torch.float32 and size == 11 and sigma == 1.5:
+		return FusedSSIM.apply(rendered.contiguous(), gt.detach().contiguous())
+
 	a = rendered.permute(2, 0, 1).unsqueeze(0)
 	b = gt.permute(2, 0, 1).unsqueeze(0)
 	window = _window(size, sigma, a.device, a.dtype)
