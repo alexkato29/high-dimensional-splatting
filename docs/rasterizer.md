@@ -2,11 +2,9 @@
 
 Per chunk of the program, I explain an optimization, how I found it, how I addressed it, and what it did. The prefix is the commit the optimization landed in.
 
-## Forward Pass
+## Project Gaussians
 
-### Project Gaussians
-
-##### (`fd0f75e`) Understand the shape of your matrices
+### (`fd0f75e`) Understand the shape of your matrices
 I noticed that this part of the pass was far and away the longest. We were calling 3 batched matmuls of shapes like [1.1M, 3, 3]. That is a ridiculously bad shape for cuBLAS... The `ampere_sgemm_128x128_nt` kernels were taking `~3.4ms` each. Sounds fast, but when we think about the work:
 - On the L4, max of 65536 matrices per BMM
 - 3.4ms / 65536 matrices = ~52ns per 3x3 multiply
@@ -14,7 +12,7 @@ I noticed that this part of the pass was far and away the longest. We were calli
 
 Abysmal ratio. I swapped matmuls for hardcoded expressions with Claude and saw a $\times3$ speedup!
 
-##### (`c80c880`) Don't repeat work
+### (`c80c880`) Don't repeat work
 I saw `aten::inverse` was taking `~18.3ms` per forward pass. Where is an inverse computed?? Turns out, once:
 ```
 @property
@@ -25,9 +23,9 @@ This property recomputes the camera center every time called. But, a camera's ce
 
 Though, the inverse wasn't even a slow target. I realized I was looking at the CPU line (`CUDA API`) which was actually just stuck in a barrier synchronization (`cudaStreamSynchronize`). The CPU is waiting on a value, but the GPU is so busy that I can revisit these syncs.
 
-### Spherical Harmonics
+## Spherical Harmonics
 
-##### (`db84ecd`, `1042c9c`) PyTorch isn't all magic
+### (`db84ecd`, `1042c9c`) PyTorch isn't all magic
 For large matrix multiplies, it's hard to beat torch. But, there are some things eager-mode PyTorch genuinely wasn't designed for. Spherical harmonics is an excellent example.
 
 To perform spherical harmonics, we must perform tons of tiny computations on lots of data. All in, ~49 multiplies and subtracts across `N` gaussians. In eager-mode, torch's own docs say:
@@ -55,9 +53,9 @@ Neither holds new information, they're just copies rearranged so cuBLAS can take
 I first tried (1) to get more PyTorch practice, and the forward total time ~halved after doing this.
 I ended up pursuing (2), because `torch.compile` can't easily handle varying parameter shapes. Every densification/culling pass, we change `N`, so compilation wasn't the right call.
 
-### Forward render
+### Forward Render
 
-##### (`0fc4d38`) Parallelize where it matters
+### (`0fc4d38`) Parallelize where it matters
 
 The original authors cleverly batch gaussians into tiles to make rendering faster. To achieve this, a kernel `duplicate_gaussians` must makes $N_g$ copies of each gaussian in memory, where $N_g$ is the number of tiles a given gaussian $g$ appears in.
 
@@ -76,7 +74,7 @@ To address both, I rewrote the algorithm around coalescing output writes (with t
 
 ## Backward Pass
 
-##### (`5ffa57c`) Atomic operations don't cleanly stack
+### (`5ffa57c`) Atomic operations don't cleanly stack
 Every thread in the backward pass computes gradients of a different pixel w.r.t a particular gaussian. When it's time to accumulate gradients via `atomicAdd(&grad_colors[g * 3 + 0], grad_color_x)`, the atomic property fortunately prevents race conditions in the memory writes! But, rather unfortunately, it does so by queueing memory write requests.
 
 When all 256 threads in the block at roughly the same time call `atomicAdd` on the same gaussian `g`, the L2 slice owning that memory address will have to queue each write to guarantee the atomic property. That leads to very long memory ops. Notably:
@@ -138,7 +136,7 @@ cycles measured:   8,944,626 / 26,214,542 = 0.3412     (0.1% off)
 ```
 
 
-##### (`25fa5ba`) Relieving SMEM pressure
+### (`25fa5ba`) Relieve SMEM pressure
 We decreased atomic operations, but it wasn't free...
 ```
 Compute (SM) Throughput [%]	89.49
@@ -234,7 +232,7 @@ Mem Pipes Busy [%]	83.50
 ```
 Much better, though it doesn't match the theoretical. That is because, if you work it out, the atomic lanes per gaussian at 3 shuffles really works out to be 2.55, not the theoretical 4.
 
-##### (`5d99e6b`, `4e427a7`) Set and verify kernels against expectations
+### (`5d99e6b`, `4e427a7`) Set and verify kernels against expectations
 GPU kernels have a small footprint, but they're also deceptively complex. Both mean it's increasingly important to be in tune not just with what every line *should* do, but what every line *actually* does.
 
 Take our backward pass. On profile, it showed `l1tex__t_requests_pipe_lsu_mem_global_op_red.sum: 28,148,949`. The reduction sum is just `atomicAdd`, so it's writing ~28M gradients. Notice from the code block:
@@ -314,3 +312,79 @@ All told:
 | + cutoff | 2,436,080 | 17,946,624 | 16,645,356 | 3,129,589 | 8.18 ms | 1.04x |
 | + footprint | 1,338,366 | 10,670,992 | 9,143,436 | 3,130,444 | 7.35 ms | 1.16x |
 | + footprint + cutoff | 1,338,366 | 9,884,720 | 9,143,403 | 3,132,371 | 7.15 ms | 1.19x |
+
+### (`9e79fb9`) Try to have *everybody* doing work
+This kernel is still severely memory *instruction* bound, with memory pipes being, on average, `85.99%` utilized. Let's take a look at the breakdown the instructions:
+
+| SASS instruction | count | share |
+| --- | ---: | ---: |
+| `SHFL` | 84,521,988 | 58.7% |
+| `LDS` | 30,578,013 | 21.2% |
+| `RED` | 28,173,996 | 19.6% |
+| `LDG` | 314,916 | 0.2% |
+| `STS` | 176,036 | 0.1% |
+| `BAR` | 128,656 | 0.1% |
+| `S2R` | 86,800 | 0.1% |
+| **total LSU instructions** | **143,980,405** | |
+
+Overwhelmingly, it's still `SHFL` instructions from our warp-level gradient reductions. Now, at this point, I didn't really know how to reduce shuffle instruction count. But, it didn't take long to stumble on reduce scatter.
+
+In the current configuration, we reduce one gradient at a time across the warp. For example:
+
+| octet lane | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| start | a0 | a1 | a2 | a3 | a4 | a5 | a6 | a7 |
+| after `shfl_down` 4 | a0+a4 | a1+a5 | a2+a6 | a3+a7 | unused | unused | unused | unused |
+| after `shfl_down` 2 | a0+a2+a4+a6 | a1+a3+a5+a7 | unused | unused | unused | unused | unused | unused |
+| after `shfl_down` 1 | a0+...+a7 | unused | unused | unused | unused | unused | unused | unused |
+
+Now, all this unused space is immediately suspicious. We have 9 gradients total to compute... Can't we do *something* with these leftover lanes?
+
+Apparently, yes. There's a clever algorithm to make better use. Reduce scatter allows us to share N values across N lanes at once.
+
+Define a "level" to be one iteration of reduce scatter. Then, generally, the algorithm for each level:
+1. A lane holds N <= # of lanes values: $x_1, x_2, ... x_n$.
+2. The lane sends half of its values to a partner lane, and receives the other half back.
+3. The lane incrementally sums and keeps the values it just received.
+4. The lane stops tracking the values it sent off.
+
+| octet lane | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| start | a0 ... h0 | a1 ... h1 | a2 ... h2 | a3 ... h3 | a4 ... h4 | a5 ... h5 | a6 ... h6 | a7 ... h7 |
+| Level 1 (4 `SHFL`) | a04 b04 c04 d04 | a15 b15 c15 d15 | a26 b26 c26 d26 | a37 b37 c37 d37 | e04 f04 g04 h04 | e15 f15 g15 h15 | e26 f26 g26 h26 | e37 f37 g37 h37 |
+| Level 2 (2 `SHFL`) | a0246 b0246 | a1357 b1357 | c0246 d0246 | c1357 d1357 | e0246 f0246 | e1357 f1357 | g0246 h0246 | g1357 h1357 |
+| Level 3 (1 `SHFL`) | **A** | **B** | **C** | **D** | **E** | **F** | **G** | **H** |
+
+In just 3 levels (and 7 shuffles), we have 8 gradients! 3 levels comes from the same logic as the initial approach, $log_2(8) = 3$. Before, it was much worse:
+
+| 8 gradients | one at a time | reduce scatter |
+| --- | ---: | ---: |
+| `SHFL` | 24 | 7 |
+| lanes holding a finished sum | 1 of 8 (lane 0 holds all 8) | 8 of 8 (lane k holds gradient k) |
+| `RED` instructions | 8 | 1 |
+
+Of course, there are actually 9 gradients. For an 8 lane octet, we are capped at computing 8. We *could* compute all 9 at once by using 16 instead of 8 lanes per reduce scatter, but as we observed in (25fa5ba), using 4 levels and 2 atomic adds just puts more net pressure on the LSU pipeline and alleviates pressure on the already pretty relaxed L2 cache. Instead, we will just run the old shuffle down process one additional time to get the last gradient.
+
+We are left with 7 shuffles for 8 gradients and 3 additional shuffles for the remaining one. All told, the final changes change instruction counts to:
+
+| SASS instruction (after) | count | share |
+| --- | ---: | ---: |
+| `SHFL` | 31,305,110 | 45.4% |
+| `LDS` | 30,616,150 | 44.4% |
+| `RED` | 6,261,022 | 9.1% |
+| `LDG` | 315,440 | 0.5% |
+| `STS` | 176,560 | 0.3% |
+| `BAR` | 128,832 | 0.2% |
+| `S2R` | 86,800 | 0.1% |
+| **total LSU instructions** | **68,889,914** | |
+
+We have massively reduced shuffle instructions, and the speedup is immediate.
+
+| counter | before | after |
+| --- | ---: | ---: |
+| `gpu__time_duration.sum` (ms) | 7.03 | 5.63 |
+| `gpc__cycles_elapsed.max` | 5,855,414 | 4,598,082 |
+| `sm__inst_executed_pipe_lsu` [%] | 85.99 | 52.60 |
+| `smsp__inst_executed.sum` | 777,003,771 | 764,328,715 |
+| `l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum` | 71,917,083 | 42,947,393 |
+| `lts__d_atomic_input_cycles_active` [%] | 51.46 | 38.49 |
