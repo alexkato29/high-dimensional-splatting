@@ -18,8 +18,8 @@ Coming Soon.
 ## Usage
 
 ```bash
-poetry install
-poetry run python -m gaussian_splatting.main path/to/colmap/scene
+uv sync
+uv run python -m gaussian_splatting.main path/to/colmap/scene
 ```
 
 **Dataset Structure:**
