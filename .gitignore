@@ -2,8 +2,6 @@
 data/
 .DS_Store
 notes.md
-tests/
-pytest.ini
 .zed/
 profiles/
 .claude/
