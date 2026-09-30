@@ -27,6 +27,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 	int image_height
 );
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
+	torch::Tensor features,
+	torch::Tensor means2D,
+	torch::Tensor conic,
+	torch::Tensor color_opacity,
+	torch::Tensor values_sorted,
+	torch::Tensor tile_ranges,
+	int image_width,
+	int image_height
+);
+
 torch::Tensor eval_sh(
 	torch::Tensor sh_dc,
 	torch::Tensor sh_rest,

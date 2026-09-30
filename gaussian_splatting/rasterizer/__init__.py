@@ -25,6 +25,7 @@ def _get_rasterizer() -> Any:
 	sources = [
 		str(current_dir / "forward.cu"),
 		str(current_dir / "backward.cu"),
+		str(current_dir / "features.cu"),
 		str(current_dir / "sh.cu"),
 		str(current_dir / "projection.cu"),
 		str(current_dir / "ssim.cu"),
@@ -63,9 +64,10 @@ class RasterizeGaussians(torch.autograd.Function):
 		colors: torch.Tensor,
 		opacities: torch.Tensor,
 		background: torch.Tensor,
+		features: torch.Tensor | None,
 		image_width: int,
 		image_height: int
-	) -> torch.Tensor:
+	) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 		"""Renders the image and saves what the backward pass needs to replay the blend.
 
 		Args:
@@ -77,11 +79,12 @@ class RasterizeGaussians(torch.autograd.Function):
 			colors: [N, 3] RGB.
 			opacities: [N, 1] in (0, 1).
 			background: [3] RGB shown wherever the gaussians do not cover.
+			features: [N, D] channels blended over a zero background, or None.
 			image_width: Output width in pixels.
 			image_height: Output height in pixels.
 
 		Returns:
-			[H, W, 3] rendered image.
+			[H, W, 3] rendered image, followed by the [H, W, D] feature image when features are given.
 		"""
 		image, final_transmittance, n_contrib, values_sorted, tile_ranges, conic, color_opacity = (
 			_get_rasterizer().rasterize(
@@ -99,10 +102,15 @@ class RasterizeGaussians(torch.autograd.Function):
 		ctx.save_for_backward(means2D, conic, color_opacity, values_sorted, tile_ranges,
 							  final_transmittance, n_contrib, background)
 		ctx.image_size = (int(image_width), int(image_height))
-		return image
+		if features is None:
+			return image
+		feature_planes, _, _ = _get_rasterizer().rasterize_features(
+			features.contiguous(), means2D.contiguous(), conic, color_opacity, values_sorted, tile_ranges,
+			int(image_width), int(image_height))
+		return image, feature_planes.permute(1, 2, 0)
 
 	@staticmethod
-	def backward(ctx, grad_image: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+	def backward(ctx, grad_image: torch.Tensor, grad_features: torch.Tensor | None = None) -> tuple[torch.Tensor | None, ...]:
 		"""Walks each pixel's gaussian list back to front to recover the per gaussian gradients.
 
 		Args:
@@ -130,7 +138,7 @@ class RasterizeGaussians(torch.autograd.Function):
 				width,
 				height
 			)
-		return grad_means2D, None, None, grad_conics, grad_colors, grad_opacities, None, None, None
+		return grad_means2D, None, None, grad_conics, grad_colors, grad_opacities, None, None, None, None
 
 
 def rasterize(
@@ -142,8 +150,9 @@ def rasterize(
 	opacities: torch.Tensor,
 	image_width: int,
 	image_height: int,
-	background: torch.Tensor | None = None
-) -> torch.Tensor:
+	background: torch.Tensor | None = None,
+	features: torch.Tensor | None = None
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 	"""Alpha blends projected gaussians into an image, front to back, on 16x16 pixel tiles.
 
 	The first four arguments come from project_gaussians.
@@ -158,9 +167,11 @@ def rasterize(
 		image_width: Output width in pixels.
 		image_height: Output height in pixels.
 		background: [3] RGB shown wherever the gaussians do not cover, black by default.
+		features: [N, D] channels blended with the same weights over a zero background, with D one of
+			16, 32, 64 or 128. None renders RGB only.
 
 	Returns:
-		[H, W, 3] rendered image.
+		[H, W, 3] rendered image, or (image, [H, W, D] feature image) when features are given.
 	"""
 	n = means2D.shape[0]
 	assert means2D.shape == (n, 2)
@@ -170,6 +181,7 @@ def rasterize(
 	if background is None:
 		background = torch.zeros(3, device=means2D.device, dtype=means2D.dtype)
 	assert background.shape == (3,)
+	assert features is None or (features.ndim == 2 and features.shape[0] == n)
 
-	return RasterizeGaussians.apply(means2D, depths, radii, conics, colors, opacities, background,
+	return RasterizeGaussians.apply(means2D, depths, radii, conics, colors, opacities, background, features,
 									image_width, image_height)

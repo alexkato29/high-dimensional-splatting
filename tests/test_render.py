@@ -50,6 +50,33 @@ def render_and_grads(rasterizer, inputs: tuple, width: int, height: int, backgro
 	return image.detach(), [t.grad for t in leaves]
 
 
+def assert_image_close(got: torch.Tensor, want: torch.Tensor) -> None:
+	diff = (got - want).abs()
+	perc_99 = torch.quantile(diff.flatten(), 0.99)
+	assert diff.max() < 2e-3 and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
+
+
+@pytest.mark.parametrize("channels", [16, 32, 64, 128])
+@torch.no_grad()
+def test_features_forward_matches_oracle(channels):
+	width, height = 128, 96
+	inputs = scene(0, 3000, width, height)
+	g = torch.Generator(device="cuda").manual_seed(2)
+	features = torch.rand(3000, channels, generator=g, device="cuda")
+
+	image, feature_image = rasterize(*inputs, width, height, features=features)
+	assert torch.equal(image, rasterize(*inputs, width, height))
+	means2D, depths, radii, conics, _, opacities = inputs
+	assert_image_close(feature_image, rasterize_reference(means2D, depths, radii, conics, features, opacities, width, height))
+
+
+def test_unsupported_feature_width_is_rejected():
+	width, height = 32, 32
+	inputs = scene(0, 100, width, height)
+	with pytest.raises(RuntimeError, match="16, 32, 64 or 128"):
+		rasterize(*inputs, width, height, features=torch.rand(100, 24, device="cuda"))
+
+
 def test_rgb_matches_oracle():
 	width, height = 128, 96
 	inputs = scene(0, 3000, width, height)
@@ -60,9 +87,7 @@ def test_rgb_matches_oracle():
 	image, grads = render_and_grads(rasterize, inputs, width, height, background, grad_image)
 	target_image, target_grads = render_and_grads(rasterize_reference, inputs, width, height, background, grad_image)
 
-	diff = torch.abs(image - target_image)
-	perc_99 = torch.quantile(diff.flatten(), 0.99)
-	assert diff.max() < 2e-3 and perc_99 < 1e-4
+	assert_image_close(image, target_image)
 
 	for name, got, want in zip(("means2D", "conics", "colors", "opacities"), grads, target_grads):
 		scale = want.abs().max().item()

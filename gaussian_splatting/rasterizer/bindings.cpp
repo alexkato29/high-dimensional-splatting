@@ -26,6 +26,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("image_width"),
 		py::arg("image_height")
 	);
+	m.def("rasterize_features", &rasterize_features, "Blend D-channel features over the binned gaussians (CUDA)");
 	m.def("eval_sh", &eval_sh, "Spherical harmonics colors (CUDA)",
 		py::arg("sh_dc"),
 		py::arg("sh_rest"),
