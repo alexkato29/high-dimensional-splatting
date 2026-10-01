@@ -18,6 +18,32 @@ __device__ inline int2 pixel_to_tile(float2 pixel) {
 	return make_int2(static_cast<int>(floorf(pixel.x / TILE_SIZE)), static_cast<int>(floorf(pixel.y / TILE_SIZE)));
 }
 
+#define FULL_MASK 0xffffffffu
+
+// Sums V values (a power of two) across each aligned group of GROUP lanes.
+template <int V, int GROUP>
+__device__ inline float reduce_scatter(float* v, int lane) {
+	int n = V;
+	#pragma unroll
+	for (int offset = GROUP / 2; offset > 0; offset /= 2) {
+		if (n > 1) {
+			bool hi = lane & offset;
+			#pragma unroll
+			for (int i = 0; i < V / 2; i++) {
+				if (i < n / 2) {
+					float send = hi ? v[i] : v[i + n / 2];
+					float keep = hi ? v[i + n / 2] : v[i];
+					v[i] = keep + __shfl_xor_sync(FULL_MASK, send, offset);
+				}
+			}
+			n /= 2;
+		} else {
+			v[0] += __shfl_xor_sync(FULL_MASK, v[0], offset);
+		}
+	}
+	return v[0];
+}
+
 __device__ inline float2 alpha_extent(float a_conic, float b_conic, float c_conic, float opacity) {
 	float k = sqrtf(2.0f * logf(opacity / MIN_ALPHA));
 	float det_conic = a_conic * c_conic - b_conic * b_conic;

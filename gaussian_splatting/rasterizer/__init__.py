@@ -99,14 +99,18 @@ class RasterizeGaussians(torch.autograd.Function):
 				int(image_height)
 			)
 		)
-		ctx.save_for_backward(means2D, conic, color_opacity, values_sorted, tile_ranges,
-							  final_transmittance, n_contrib, background)
 		ctx.image_size = (int(image_width), int(image_height))
 		if features is None:
+			ctx.save_for_backward(means2D, conic, color_opacity, values_sorted, tile_ranges,
+								  final_transmittance, n_contrib, background, None, None, None)
 			return image
-		feature_planes, _, _ = _get_rasterizer().rasterize_features(
-			features.contiguous(), means2D.contiguous(), conic, color_opacity, values_sorted, tile_ranges,
+		features = features.contiguous()
+		feature_planes, feature_transmittance, feature_contrib = _get_rasterizer().rasterize_features(
+			features, means2D.contiguous(), conic, color_opacity, values_sorted, tile_ranges,
 			int(image_width), int(image_height))
+		ctx.save_for_backward(means2D, conic, color_opacity, values_sorted, tile_ranges,
+							  final_transmittance, n_contrib, background, features, feature_transmittance,
+							  feature_contrib)
 		return image, feature_planes.permute(1, 2, 0)
 
 	@staticmethod
@@ -116,13 +120,14 @@ class RasterizeGaussians(torch.autograd.Function):
 		Args:
 			ctx: Autograd context holding the tensors saved during the forward pass.
 			grad_image: [H, W, 3] gradient of the loss with respect to the rendered image.
+			grad_features: [H, W, D] gradient with respect to the feature image, when features were given.
 
 		Returns:
 			One gradient per forward argument, and None for the arguments that are not
 			differentiable, namely depths, radii, background and the image size.
 		"""
-		(means2D, conic, color_opacity, values_sorted, tile_ranges,
-		 final_transmittance, n_contrib, background) = ctx.saved_tensors
+		(means2D, conic, color_opacity, values_sorted, tile_ranges, final_transmittance, n_contrib, background,
+		 features, feature_transmittance, feature_contrib) = ctx.saved_tensors
 		width, height = ctx.image_size
 		with torch.cuda.nvtx.range("rasterize_backward"):
 			grad_means2D, grad_conics, grad_colors, grad_opacities = _get_rasterizer().rasterize_backward(
@@ -138,7 +143,18 @@ class RasterizeGaussians(torch.autograd.Function):
 				width,
 				height
 			)
-		return grad_means2D, None, None, grad_conics, grad_colors, grad_opacities, None, None, None, None
+		grad_feats = None
+		if features is not None and ctx.needs_input_grad[7]:
+			with torch.cuda.nvtx.range("rasterize_features_backward"):
+				grad_feats, feat_means2D, feat_conics, feat_opacities = (
+					_get_rasterizer().rasterize_features_backward(
+						grad_features.permute(2, 0, 1).contiguous(), features, means2D, conic, color_opacity,
+						values_sorted, tile_ranges, feature_transmittance, feature_contrib, width, height))
+			# Both images depend on the same geometry, so their gradients add up.
+			grad_means2D += feat_means2D
+			grad_conics += feat_conics
+			grad_opacities += feat_opacities
+		return grad_means2D, None, None, grad_conics, grad_colors, grad_opacities, None, grad_feats, None, None
 
 
 def rasterize(
@@ -168,7 +184,7 @@ def rasterize(
 		image_height: Output height in pixels.
 		background: [3] RGB shown wherever the gaussians do not cover, black by default.
 		features: [N, D] channels blended with the same weights over a zero background, with D one of
-			16, 32, 64 or 128. None renders RGB only.
+			32, 64 or 128. None renders RGB only.
 
 	Returns:
 		[H, W, 3] rendered image, or (image, [H, W, D] feature image) when features are given.

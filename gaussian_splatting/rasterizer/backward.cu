@@ -3,32 +3,6 @@
 #include "common.cuh"
 #include "api.h"
 
-__device__ inline float warp_octet_sum(float v) {
-	for (int offset = 4; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffffu, v, offset);
-	return v;
-}
-
-__device__ inline float octet_reduce_scatter(float v[8], int lane) {
-	bool hi = lane & 4;
-	#pragma unroll
-	for (int i = 0; i < 4; i++) {
-		float send = hi ? v[i] : v[i + 4];
-		float keep = hi ? v[i + 4] : v[i];
-		v[i] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
-	}
-	hi = lane & 2;
-	#pragma unroll
-	for (int i = 0; i < 2; i++) {
-		float send = hi ? v[i] : v[i + 2];
-		float keep = hi ? v[i + 2] : v[i];
-		v[i] = keep + __shfl_xor_sync(0xffffffffu, send, 2);
-	}
-	hi = lane & 1;
-	float send = hi ? v[0] : v[1];
-	float keep = hi ? v[1] : v[0];
-	return keep + __shfl_xor_sync(0xffffffffu, send, 1);
-}
-
 
 __global__ void render_gaussians_backward(
 	const uint2* tile_ranges,
@@ -90,6 +64,7 @@ __global__ void render_gaussians_backward(
 							+ background[1] * dL_dpixel.y
 							+ background[2] * dL_dpixel.z;
 
+	// From the paper's convention, accum_rec is the accumulated color behind a gaussian.
 	float3 accum_rec = make_float3(0.0f, 0.0f, 0.0f);
 	float3 last_color = make_float3(0.0f, 0.0f, 0.0f);
 	float last_alpha = 0.0f;
@@ -168,8 +143,9 @@ __global__ void render_gaussians_backward(
 					dL_dopacity,
 					dL_dmean2D.x, dL_dmean2D.y,
 					dL_dconic.x, dL_dconic.y};
-				float total = octet_reduce_scatter(v, tid);
-				float grad_conic_z = warp_octet_sum(dL_dconic.z);
+				float total = reduce_scatter<8, 8>(v, tid);
+				float grad_conic_z = dL_dconic.z;
+				reduce_scatter<1, 8>(&grad_conic_z, tid);
 
 				// Every lane of an octet holds a different finished gradient, so one RED writes all 8.
 				if ((active >> (tid & 24)) & 0xffu) {

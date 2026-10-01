@@ -3,8 +3,6 @@
 #include "common.cuh"
 #include "api.h"
 
-#define FULL_MASK 0xffffffffu
-
 
 // The alpha_extent box widened slightly so fast-math rounding never culls a gaussian some pixel might accept.
 __device__ inline float2 culling_extent(float4 c, float opacity) {
@@ -215,12 +213,283 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
 
 	// The fastest launch layout measured on an L4 for each D.
 	switch (D) {
-		case 16: std::apply(launch_render_features<16, 1, 256, 128>, args); break;
 		case 32: std::apply(launch_render_features<32, 1, 256, 128>, args); break;
 		case 64: std::apply(launch_render_features<64, 1, 256, 128>, args); break;
 		case 128: std::apply(launch_render_features<128, 2, 128, 64>, args); break;
-		default: TORCH_CHECK(false, "features must have 16, 32, 64 or 128 channels, got ", D);
+		default: TORCH_CHECK(false, "features must have 32, 64 or 128 channels, got ", D);
 	}
 	check_cuda_error("render_features");
 	return {output, final_transmittance, n_contrib};
+}
+
+template <int D, int BATCH>
+__global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
+	const uint2* tile_ranges,
+	const int* values_sorted,
+	const float2* means2D,
+	const float4* conic,
+	const float4* color_opacity,
+	const float4* features,
+	const float* final_transmittance,
+	const int* n_contrib,
+	const float* grad_output,
+	int image_width,
+	int image_height,
+	float* grad_means2D,
+	float* grad_conics,
+	float* grad_features,
+	float* grad_opacities
+) {
+	constexpr int VEC4_PER_ROW = D / 4;
+	constexpr int CHANNELS_PER_LANE = D / 32;
+	static_assert(D % 32 == 0, "each lane must own the same number of channels");
+	static_assert(BATCH % 32 == 0, "culling tests 32 gaussians per ballot");
+
+	const int tid = threadIdx.x;
+	const int lane = tid & 31;
+	const int warp = tid >> 5;
+
+	const int tile_idx = blockIdx.x;
+	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
+	const int tile_x0 = (tile_idx % tiles_x) * TILE_SIZE;
+	const int tile_y0 = (tile_idx / tiles_x) * TILE_SIZE;
+
+	const int px = tile_x0 + tid % TILE_SIZE;
+	const int py = tile_y0 + tid / TILE_SIZE;
+	const bool inside = px < image_width && py < image_height;
+	const float2 pixel = make_float2(px + 0.5f, py + 0.5f);
+	const int pixel_idx = py * image_width + px;
+
+	const int plane = image_width * image_height;
+	const float4 rect = warp_rect(pixel);
+
+	__shared__ int s_id[BATCH];
+	__shared__ float2 s_mean[BATCH];
+	__shared__ float4 s_conic[BATCH];
+	__shared__ float2 s_extent[BATCH];
+	__shared__ float4 s_feat4[BATCH * VEC4_PER_ROW];
+	__shared__ float s_weight[RENDER_BATCH];
+	__shared__ int s_last_contributor;
+	const float* s_feat = reinterpret_cast<const float*>(s_feat4);
+
+	// Cooperatively load dL/dpixel into registers s.t. each thread grabs multiple channels of each pixel.
+	// grad[i][p] is dL/dpixel for channel lane + 32*i of the warp's pixel p. Remember that, when D >= 1,
+	// we render two images of shape [H, W, 3] (the rgb image) and [H, W, D] (the feature map). We are,
+	// in this kernel, only concerned with pixels from the second.
+	float grad[CHANNELS_PER_LANE][32];
+	#pragma unroll
+	for (int p = 0; p < 32; p++) {
+		int x = tile_x0 + (warp * 32 + p) % TILE_SIZE;
+		int y = tile_y0 + (warp * 32 + p) / TILE_SIZE;
+		bool in = x < image_width && y < image_height;
+		#pragma unroll
+		for (int i = 0; i < CHANNELS_PER_LANE; i++)
+			grad[i][p] = in ? grad_output[(lane + 32 * i) * plane + y * image_width + x] : 0.0f;
+	}
+	float transmittance = inside ? final_transmittance[pixel_idx] : 0.0f;
+	int last_contributor = inside ? n_contrib[pixel_idx] : 0;
+
+	// Start below the block's deepest contributor, as render_gaussians_backward does.
+	uint2 range = tile_ranges[tile_idx];
+	if (tid == 0) s_last_contributor = 0;
+	__syncthreads();
+	atomicMax(&s_last_contributor, last_contributor);
+	__syncthreads();
+	int num_todo = min((int)range.y - (int)range.x, s_last_contributor);
+
+	float rec = 0.0f;
+	for (int batch_end = num_todo; batch_end > 0; batch_end -= BATCH) {
+		int batch_count = min(BATCH, batch_end);
+		int batch_start = batch_end - batch_count;
+
+		__syncthreads();
+		for (int i = tid; i < batch_count; i += RENDER_BATCH) {
+			int g = values_sorted[range.x + batch_start + i];
+			s_id[i] = g;
+			s_mean[i] = means2D[g];
+			float4 c = conic[g];
+			float opacity = color_opacity[g].w;
+			s_conic[i] = make_float4(c.x, c.y, c.z, opacity);
+			s_extent[i] = culling_extent(c, opacity);
+		}
+
+		__syncthreads();
+		for (int i = tid; i < batch_count * VEC4_PER_ROW; i += RENDER_BATCH) {
+			int k = i / VEC4_PER_ROW;
+			s_feat4[i] = features[(size_t)s_id[k] * VEC4_PER_ROW + (i - k * VEC4_PER_ROW)];
+		}
+		__syncthreads();
+
+		// Walk the batch back to front. (batch_count - 1) / 32 * 32 rounds down to the closest smaller
+		// multiple of 32 so each lane has a
+		for (int j0 = (batch_count - 1) / 32 * 32; j0 >= 0; j0 -= 32) {
+			int jl = j0 + lane;
+
+			// Each thread owns a set of channels from each gaussian. Thus, each thread must know if each
+			// gaussian is active (thus why a ballot sync is required).
+			unsigned mask = __ballot_sync(FULL_MASK, jl < batch_count && box_hits(s_mean[jl], s_extent[jl], rect));
+			while (mask) {
+			    // Find the deepest gaussian in our mask, then flip it to a zero to mark it as visited.
+				int bit = 31 - __clz(mask);
+				mask &= ~(1u << bit);
+				int j = j0 + bit;
+
+				// Skip out of bounds pixels or too deep of gaussians.
+				bool contributes = inside && batch_start + j < last_contributor;
+				float alpha = 0.0f, gauss = 0.0f, raw_alpha = 0.0f, dx = 0.0f, dy = 0.0f;
+				float4 c = s_conic[j];
+
+				// Skip gaussians that don't influence the thread's associated pixel.
+				if (contributes) {
+					float2 mean = s_mean[j];
+					dx = pixel.x - mean.x;
+					dy = pixel.y - mean.y;
+					float mahalanobis = dx * (c.x * dx + c.y * dy) + dy * (c.y * dx + c.z * dy);
+					gauss = __expf(-0.5f * mahalanobis);
+					raw_alpha = c.w * gauss;
+					alpha = fminf(MAX_ALPHA, raw_alpha);
+					contributes = alpha >= MIN_ALPHA;
+				}
+				if (!__any_sync(FULL_MASK, contributes)) continue;
+
+				// f \dot dL/dpixel for all 32 pixels. Each lane computes its partial over its channels, then
+				// it's summed across lanes w/ a reduce scatter. Afterward, lane p holds the dot for pixel p.
+				float f[CHANNELS_PER_LANE];
+				#pragma unroll
+				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[j * D + lane + 32 * i];
+				float partial[32];
+				#pragma unroll
+				for (int p = 0; p < 32; p++) {
+					partial[p] = 0.0f;
+					#pragma unroll
+					for (int i = 0; i < CHANNELS_PER_LANE; i++) partial[p] += f[i] * grad[i][p];
+				}
+				float dot = reduce_scatter<32, 32>(partial, lane);
+
+				// Compute dL/dAlpha, which the derivatives of opacity/means/conics depend on.
+				float dL_dalpha = 0.0f;
+				float weight = 0.0f;
+				if (contributes) {
+					float inv_one_minus_alpha = __fdividef(1.0f, 1.0f - alpha);
+					transmittance *= inv_one_minus_alpha;
+					weight = transmittance * alpha;
+					dL_dalpha = transmittance * (dot - rec);
+					rec = alpha * dot + (1.0f - alpha) * rec;
+				}
+
+				// Compute the partials of opacity, means, and conics for the gaussian wrt each pixel.
+				// Last two elements of v are never used and exist purely as padding for reduce scatter,
+				// which mandates the input value contain a power of two elements.
+				float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+				// A clamped alpha no longer depends on the gaussian so nothing flows past it.
+				if (contributes && raw_alpha <= MAX_ALPHA) {
+				    // c.w is opacity.
+					float dL_dG = c.w * dL_dalpha;
+					v[0] = gauss * dL_dalpha;
+
+					v[1] = dL_dG * gauss * (c.x * dx + c.y * dy);
+					v[2] = dL_dG * gauss * (c.y * dx + c.z * dy);
+
+					v[3] = dL_dG * gauss * -0.5f * dx * dx;
+					v[4] = dL_dG * gauss * -dx * dy;
+					v[5] = dL_dG * gauss * -0.5f * dy * dy;
+				}
+
+				// Total holds all partial derivates summed across the whole warp. for 0<=k<=5, each
+				// lane 4k to 4k + 3 holds one of the derivatives. They're repeated since the
+				// reduce scatter is undersaturated given its template parameters.
+				float total = reduce_scatter<8, 32>(v, lane);
+				int k = lane >> 2;
+
+				int g = s_id[j];
+				// k = 6, 7 will have no values because they were purely for padding the reduce scatter.
+				if ((lane & 3) == 0 && k < 6) {
+					float* dst = k == 0 ? &grad_opacities[g]
+							   : k < 3 ? &grad_means2D[g * 2 + (k - 1)]
+							   : &grad_conics[g * 3 + (k - 3)];
+					atomicAdd(dst, total);
+				}
+
+				s_weight[tid] = weight;
+				__syncwarp();
+				float w[32];
+				#pragma unroll
+				for (int p = 0; p < 32; p++) w[p] = s_weight[warp * 32 + p];
+				__syncwarp();
+
+				#pragma unroll
+				for (int i = 0; i < CHANNELS_PER_LANE; i++) {
+					float dL_df = 0.0f;
+					#pragma unroll
+					for (int p = 0; p < 32; p++) dL_df += w[p] * grad[i][p];
+					// Each lane writes to a different address with CHANNELS_PER_LANE values, so this
+					// atomic is not as heavy hitting as it seems.
+					atomicAdd(&grad_features[(size_t)g * D + lane + 32 * i], dL_df);
+				}
+			}
+		}
+	}
+}
+
+template <int D, int BATCH>
+static void launch_render_features_backward(int num_tiles, const uint2* tile_ranges, const int* values_sorted,
+											const float2* means2D, const float4* conic,
+											const float4* color_opacity, const float4* features,
+											const float* final_transmittance, const int* n_contrib,
+											const float* grad_output, int width, int height,
+											float* grad_means2D, float* grad_conics, float* grad_features,
+											float* grad_opacities) {
+	render_features_backward<D, BATCH><<<num_tiles, RENDER_BATCH>>>(
+		tile_ranges, values_sorted, means2D, conic, color_opacity, features, final_transmittance, n_contrib,
+		grad_output, width, height, grad_means2D, grad_conics, grad_features, grad_opacities
+	);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features_backward(
+	torch::Tensor grad_output,
+	torch::Tensor features,
+	torch::Tensor means2D,
+	torch::Tensor conic,
+	torch::Tensor color_opacity,
+	torch::Tensor values_sorted,
+	torch::Tensor tile_ranges,
+	torch::Tensor final_transmittance,
+	torch::Tensor n_contrib,
+	int image_width,
+	int image_height
+) {
+	TORCH_CHECK(grad_output.is_cuda() && grad_output.is_contiguous(), "grad_output must be a contiguous CUDA tensor");
+
+	const int num_gaussians = features.size(0);
+	const int D = features.size(1);
+	const int num_tiles = ((image_width + TILE_SIZE - 1) / TILE_SIZE) * ((image_height + TILE_SIZE - 1) / TILE_SIZE);
+
+	auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+	torch::Tensor grad_features = torch::zeros({num_gaussians, D}, f32);
+	torch::Tensor grad_means2D = torch::zeros({num_gaussians, 2}, f32);
+	torch::Tensor grad_conics = torch::zeros({num_gaussians, 3}, f32);
+	torch::Tensor grad_opacities = torch::zeros({num_gaussians, 1}, f32);
+
+	auto args = std::make_tuple(
+		num_tiles,
+		reinterpret_cast<const uint2*>(tile_ranges.data_ptr<int>()),
+		values_sorted.data_ptr<int>(),
+		reinterpret_cast<const float2*>(means2D.data_ptr<float>()),
+		reinterpret_cast<const float4*>(conic.data_ptr<float>()),
+		reinterpret_cast<const float4*>(color_opacity.data_ptr<float>()),
+		reinterpret_cast<const float4*>(features.data_ptr<float>()),
+		final_transmittance.data_ptr<float>(), n_contrib.data_ptr<int>(),
+		grad_output.data_ptr<float>(), image_width, image_height,
+		grad_means2D.data_ptr<float>(), grad_conics.data_ptr<float>(), grad_features.data_ptr<float>(),
+		grad_opacities.data_ptr<float>()
+	);
+
+	switch (D) {
+		case 32: std::apply(launch_render_features_backward<32, 128>, args); break;
+		case 64: std::apply(launch_render_features_backward<64, 128>, args); break;
+		case 128: std::apply(launch_render_features_backward<128, 64>, args); break;
+		default: TORCH_CHECK(false, "features must have 32, 64 or 128 channels, got ", D);
+	}
+	check_cuda_error("render_features_backward");
+	return {grad_features, grad_means2D, grad_conics, grad_opacities};
 }

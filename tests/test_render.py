@@ -56,7 +56,18 @@ def assert_image_close(got: torch.Tensor, want: torch.Tensor) -> None:
 	assert diff.max() < 2e-3 and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
 
 
-@pytest.mark.parametrize("channels", [16, 32, 64, 128])
+def assert_grads_close(names: tuple[str, ...], grads: list[torch.Tensor], target_grads: list[torch.Tensor]) -> None:
+	for name, got, want in zip(names, grads, target_grads):
+		scale = want.abs().max().item()
+		bad = ~torch.isclose(got, want, rtol=1e-3, atol=1e-4 * scale)
+
+		# A gaussian sitting on a cutoff blends in with one precision and not the other so a few can miss.
+		assert bad.float().mean() < 1e-3, f"{name}: {bad.sum().item()} of {bad.numel()} outside tolerance"
+		err = (got - want).abs().max().item()
+		assert err < 2e-3 * scale, f"{name}: max error {err:.2e} of max {scale:.2e}"
+
+
+@pytest.mark.parametrize("channels", [32, 64, 128])
 @torch.no_grad()
 def test_features_forward_matches_oracle(channels):
 	width, height = 128, 96
@@ -73,7 +84,7 @@ def test_features_forward_matches_oracle(channels):
 def test_unsupported_feature_width_is_rejected():
 	width, height = 32, 32
 	inputs = scene(0, 100, width, height)
-	with pytest.raises(RuntimeError, match="16, 32, 64 or 128"):
+	with pytest.raises(RuntimeError, match="32, 64 or 128"):
 		rasterize(*inputs, width, height, features=torch.rand(100, 24, device="cuda"))
 
 
@@ -89,11 +100,22 @@ def test_rgb_matches_oracle():
 
 	assert_image_close(image, target_image)
 
-	for name, got, want in zip(("means2D", "conics", "colors", "opacities"), grads, target_grads):
-		scale = want.abs().max().item()
-		bad = ~torch.isclose(got, want, rtol=1e-3, atol=1e-4 * scale)
+	assert_grads_close(("means2D", "conics", "colors", "opacities"), grads, target_grads)
 
-		# A gaussian sitting on a cutoff blends in with one precision and not the other so a few can miss.
-		assert bad.float().mean() < 1e-3, f"{name}: {bad.sum().item()} of {bad.numel()} outside tolerance"
-		err = (got - want).abs().max().item()
-		assert err < 2e-3 * scale, f"{name}: max error {err:.2e} of max {scale:.2e}"
+
+@pytest.mark.parametrize("channels", [32, 64, 128])
+def test_features_backward_matches_oracle(channels):
+	width, height = 128, 96
+	means2D, depths, radii, conics, colors, opacities = scene(0, 3000, width, height)
+	g = torch.Generator(device="cuda").manual_seed(3)
+	features = torch.rand(3000, channels, generator=g, device="cuda")
+	grad_features = torch.rand(height, width, channels, generator=g, device="cuda")
+
+	def feature_grads(render):
+		leaves = [t.detach().clone().requires_grad_(True) for t in (means2D, conics, features, opacities)]
+		render(*leaves).backward(grad_features)
+		return [t.grad for t in leaves]
+
+	got = feature_grads(lambda m, c, f, o: rasterize(m, depths, radii, c, colors, o, width, height, features=f)[1])
+	want = feature_grads(lambda m, c, f, o: rasterize_reference(m, depths, radii, c, f, o, width, height))
+	assert_grads_close(("means2D", "conics", "features", "opacities"), got, want)
