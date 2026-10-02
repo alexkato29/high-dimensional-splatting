@@ -285,41 +285,45 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int threads = 256;
 	auto blocks_for = [threads](int n) { return (n + threads - 1) / threads; };
 
-	prepare_gaussians<<<blocks_for(num_gaussians), threads>>>(
-		num_gaussians,
-		means2D_ptr,
-		depths.data_ptr<float>(),
-		radii.data_ptr<float>(),
-		conics.data_ptr<float>(),
-		colors.data_ptr<float>(),
-		opacities.data_ptr<float>(),
-		num_tiles_x,
-		num_tiles_y,
-		gaussian_data_ptr,
-		conic_ptr,
-		color_opacity_ptr,
-		tiles_touched_ptr
-	);
-	check_cuda_error("prepare_gaussians");
-
 	torch::Tensor offsets = torch::empty({num_gaussians}, i32);
 	int* offsets_ptr = offsets.data_ptr<int>();
+	int total_duplicates = 0;
 
-	thrust::device_ptr<int> tiles_touched_thrust(tiles_touched_ptr);
-	thrust::device_ptr<int> offsets_thrust(offsets_ptr);
-	// This is prefix sum despite the fancy name
-	thrust::exclusive_scan(tiles_touched_thrust,
-						   tiles_touched_thrust + num_gaussians,
-						   offsets_thrust);
+	// An empty scene has no grid to launch and no last element to read so it falls through to the background.
+	if (num_gaussians > 0) {
+		prepare_gaussians<<<blocks_for(num_gaussians), threads>>>(
+			num_gaussians,
+			means2D_ptr,
+			depths.data_ptr<float>(),
+			radii.data_ptr<float>(),
+			conics.data_ptr<float>(),
+			colors.data_ptr<float>(),
+			opacities.data_ptr<float>(),
+			num_tiles_x,
+			num_tiles_y,
+			gaussian_data_ptr,
+			conic_ptr,
+			color_opacity_ptr,
+			tiles_touched_ptr
+		);
+		check_cuda_error("prepare_gaussians");
 
-	// We avoid unnecessary transfers by bringing back ONLY the last element of each
-	int last_offset;
-	int last_tiles_touched;
-	cudaMemcpy(&last_offset, offsets_ptr + num_gaussians - 1, sizeof(int),
-			   cudaMemcpyDeviceToHost);
-	cudaMemcpy(&last_tiles_touched, tiles_touched_ptr + num_gaussians - 1, sizeof(int),
-			   cudaMemcpyDeviceToHost);
-	int total_duplicates = last_offset + last_tiles_touched;
+		thrust::device_ptr<int> tiles_touched_thrust(tiles_touched_ptr);
+		thrust::device_ptr<int> offsets_thrust(offsets_ptr);
+		// This is prefix sum despite the fancy name
+		thrust::exclusive_scan(tiles_touched_thrust,
+							   tiles_touched_thrust + num_gaussians,
+							   offsets_thrust);
+
+		// We avoid unnecessary transfers by bringing back ONLY the last element of each
+		int last_offset;
+		int last_tiles_touched;
+		cudaMemcpy(&last_offset, offsets_ptr + num_gaussians - 1, sizeof(int),
+				   cudaMemcpyDeviceToHost);
+		cudaMemcpy(&last_tiles_touched, tiles_touched_ptr + num_gaussians - 1, sizeof(int),
+				   cudaMemcpyDeviceToHost);
+		total_duplicates = last_offset + last_tiles_touched;
+	}
 
 	debug_print_duplicates(num_gaussians, num_tiles_x, num_tiles_y, total_duplicates);
 
@@ -332,8 +336,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 				conic,
 				color_opacity};
 	}
-
-
 
 	torch::Tensor keys   = torch::empty({total_duplicates}, i64);
 	torch::Tensor values = torch::empty({total_duplicates}, i32);
