@@ -1,39 +1,13 @@
+from collections.abc import Sequence
+
 import pytest
 import torch
-import torch.nn.functional as F
 
-from gaussian_splatting.rasterizer import project_gaussians, rasterize
+from gaussian_splatting.rasterizer import rasterize
 from tests.oracle import rasterize_reference
+from tests.scenes import scene
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the rasterizer needs CUDA")
-
-
-def scene(seed: int, n: int, width: int, height: int, channels: int = 3) -> tuple:
-	"""Random gaussians in front of an identity camera, projected by the real projection kernel.
-
-	Args:
-		seed: Seed for every random draw.
-		n: Number of gaussians.
-		width: Image width in pixels.
-		height: Image height in pixels.
-		channels: Columns of the returned colors.
-
-	Returns:
-		(means2D, depths, radii, conics, colors, opacities), the inputs rasterize() takes.
-	"""
-	g = torch.Generator(device="cuda").manual_seed(seed)
-	rand = lambda *shape: torch.rand(*shape, generator=g, device="cuda")
-	means = rand(n, 3) * torch.tensor([4.0, 3.0, 4.0], device="cuda") + torch.tensor([-2.0, -1.5, 1.0], device="cuda")
-	scales = torch.exp(rand(n, 3) * 3 - 4.5)
-	quats = F.normalize(torch.randn(n, 4, generator=g, device="cuda"), dim=-1)
-	opacities = rand(n, 1) * 0.95 + 0.04
-	colors = rand(n, channels)
-	focal = 0.8 * width
-	with torch.no_grad():
-		means2D, depths, radii, conics = project_gaussians(
-			means, scales, quats, opacities, torch.eye(4, device="cuda"),
-			focal, focal, width / 2, height / 2, width, height)
-	return means2D, depths, radii, conics, colors, opacities
 
 
 def render_and_grads(rasterizer, inputs: tuple, width: int, height: int, background: torch.Tensor,
@@ -56,15 +30,20 @@ def assert_image_close(got: torch.Tensor, want: torch.Tensor) -> None:
 	assert diff.max() < 2e-3 and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
 
 
-def assert_grads_close(names: tuple[str, ...], grads: list[torch.Tensor], target_grads: list[torch.Tensor]) -> None:
+def assert_grads_close(names: tuple[str, ...], grads: Sequence[torch.Tensor | None],
+					   target_grads: Sequence[torch.Tensor | None]) -> None:
 	for name, got, want in zip(names, grads, target_grads):
+		assert got is not None and want is not None, f"{name}: no gradient"
+		assert got.shape == want.shape, f"{name}: shape {tuple(got.shape)} vs {tuple(want.shape)}"
+		if want.numel() == 0:
+			continue
 		scale = want.abs().max().item()
 		bad = ~torch.isclose(got, want, rtol=1e-3, atol=1e-4 * scale)
 
 		# A gaussian sitting on a cutoff blends in with one precision and not the other so a few can miss.
 		assert bad.float().mean() < 1e-3, f"{name}: {bad.sum().item()} of {bad.numel()} outside tolerance"
 		err = (got - want).abs().max().item()
-		assert err < 2e-3 * scale, f"{name}: max error {err:.2e} of max {scale:.2e}"
+		assert err <= 2e-3 * scale, f"{name}: max error {err:.2e} of max {scale:.2e}"
 
 
 @pytest.mark.parametrize("channels", [32, 64, 128])
