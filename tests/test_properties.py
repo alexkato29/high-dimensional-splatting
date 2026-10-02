@@ -5,7 +5,7 @@ from hypothesis import given
 
 from gaussian_splatting.rasterizer import rasterize
 from gaussian_splatting.rasterizer.projection import quat_to_rotmat
-from tests.scenes import gaussians, project, scene, scene_sizes
+from tests.scenes import gaussians, project, scene, scene_sizes, with_size_examples
 from tests.test_render import assert_grads_close, assert_image_close
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the rasterizer needs CUDA")
@@ -37,6 +37,7 @@ def render_with_grads(inputs: tuple, features: torch.Tensor, width: int, height:
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 def test_render_is_deterministic(channels, sizes):
 	seed, n, width, height = sizes
 	inputs = scene(seed, n, width, height)
@@ -56,6 +57,7 @@ def test_render_is_deterministic(channels, sizes):
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 def test_gaussian_order_does_not_matter(channels, sizes):
 	seed, n, width, height = sizes
 	means2D, depths, radii, conics, colors, opacities = scene(seed, n, width, height)
@@ -78,6 +80,7 @@ def test_gaussian_order_does_not_matter(channels, sizes):
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 @torch.no_grad()
 def test_invisible_gaussians_change_nothing(channels, sizes):
 	seed, n, width, height = sizes
@@ -104,6 +107,7 @@ def test_invisible_gaussians_change_nothing(channels, sizes):
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 @torch.no_grad()
 def test_blend_weights_are_convex(channels, sizes):
 	seed, n, width, height = sizes
@@ -130,6 +134,7 @@ def test_blend_weights_are_convex(channels, sizes):
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 def test_feature_channels_are_independent(channels, sizes):
 	seed, n, width, height = sizes
 	inputs = scene(seed, n, width, height)
@@ -158,6 +163,7 @@ def test_feature_channels_are_independent(channels, sizes):
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 @torch.no_grad()
 def test_features_blend_linearly(channels, sizes):
 	seed, n, width, height = sizes
@@ -174,6 +180,7 @@ def test_features_blend_linearly(channels, sizes):
 
 @pytest.mark.parametrize("half", [32, 64])
 @given(sizes=scene_sizes())
+@with_size_examples
 def test_concatenated_features_render_like_halves(half, sizes):
 	seed, n, width, height = sizes
 	inputs = scene(seed, n, width, height)
@@ -261,6 +268,7 @@ def move(g: dict[str, torch.Tensor], rotation: torch.Tensor,
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 @torch.no_grad()
 def test_mirrored_scene_renders_mirrored_image(channels, sizes):
 	seed, n, width, height = sizes
@@ -279,6 +287,7 @@ def test_mirrored_scene_renders_mirrored_image(channels, sizes):
 
 @pytest.mark.parametrize("channels", CHANNELS)
 @given(sizes=scene_sizes())
+@with_size_examples
 @torch.no_grad()
 def test_moving_scene_and_camera_together_changes_nothing(channels, sizes):
 	seed, n, width, height = sizes

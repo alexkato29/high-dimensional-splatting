@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from hypothesis import example
 from hypothesis import strategies as st
 
 from gaussian_splatting.rasterizer import project_gaussians
@@ -68,3 +69,20 @@ def scene_sizes(draw) -> tuple[int, int, int, int]:
 	n = draw(st.integers(min_value=0, max_value=max_n))
 
 	return (seed, n, width, height)
+
+
+# Sizes every property runs on top of the random draws, as (seed, n, width, height).
+SIZE_EXAMPLES = [
+	(0, 0, 1, 1),  # Empty scene.
+	(1, 1, 1, 1),  # One gaussian and one pixel.
+	(2, 3000, 16, 16),  # Exactly one tile.
+	(3, 3000, 17, 17),  # One full tile plus partial edge tiles.
+	(4, 10_000, 16, 16),  # Densest allowed tile to guarantee that every walk crosses batches.
+]
+
+
+def with_size_examples(test):
+	"""Pins SIZE_EXAMPLES onto a test that takes `sizes` from scene_sizes()."""
+	for sizes in SIZE_EXAMPLES:
+		test = example(sizes=sizes)(test)
+	return test
