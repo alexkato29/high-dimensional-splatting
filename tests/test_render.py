@@ -24,10 +24,10 @@ def render_and_grads(rasterizer, inputs: tuple, width: int, height: int, backgro
 	return image.detach(), [t.grad for t in leaves]
 
 
-def assert_image_close(got: torch.Tensor, want: torch.Tensor) -> None:
+def assert_image_close(got: torch.Tensor, want: torch.Tensor, max_error: float = 2e-3) -> None:
 	diff = (got - want).abs()
 	perc_99 = torch.quantile(diff.flatten(), 0.99)
-	assert diff.max() < 2e-3 and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
+	assert diff.max() < max_error and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
 
 
 def assert_grads_close(names: tuple[str, ...], grads: Sequence[torch.Tensor | None],

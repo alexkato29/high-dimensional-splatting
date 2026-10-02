@@ -1,8 +1,10 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from hypothesis import given
 
 from gaussian_splatting.rasterizer import rasterize
+from gaussian_splatting.rasterizer.projection import quat_to_rotmat
 from tests.scenes import gaussians, project, scene, scene_sizes
 from tests.test_render import assert_grads_close, assert_image_close
 
@@ -10,6 +12,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the raste
 
 CHANNELS = [32, 64, 128]
 GRAD_NAMES = ("means2D", "conics", "colors", "opacities", "features")
+# Room for one gaussian flipping across MIN_ALPHA between two renders of the same scene.
+FLIP_MAX_ERROR = 1e-2
 
 
 def rand(g: torch.Generator, *shape: int) -> torch.Tensor:
@@ -190,3 +194,110 @@ def test_concatenated_features_render_like_halves(half, sizes):
 	# The whole width runs a different kernel instance than each half due to templating.
 	assert torch.equal(whole_image, torch.cat([left_image, right_image], dim=-1))
 	assert_grads_close(("features",), [whole_grad], [torch.cat([left_grad, right_grad], dim=1)])
+
+
+def quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+	"""Hamilton product of (w, x, y, z) quaternions, broadcasting over leading dims.
+
+	quat_to_rotmat(quat_multiply(q1, q2)) = quat_to_rotmat(q1) @ quat_to_rotmat(q2), so q2 rotates first.
+	"""
+	a1, b1, c1, d1 = q1.unbind(-1)
+	a2, b2, c2, d2 = q2.unbind(-1)
+	return torch.stack([
+		a1 * a2 - b1 * b2 - c1 * c2 - d1 * d2,
+		a1 * b2 + b1 * a2 + c1 * d2 - d1 * c2,
+		a1 * c2 - b1 * d2 + c1 * a2 + d1 * b2,
+		a1 * d2 + b1 * c2 - c1 * b2 + d1 * a2,
+	], dim=-1)
+
+
+def mirror(g: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+	"""Reflects every gaussian across the camera's vertical plane, x -> -x in camera space.
+
+	Args:
+		g: gaussians() output, seen by the identity camera.
+
+	Returns:
+		A new dict in the same format, input untouched.
+	"""
+	mirrored = dict(g)
+	flip_x = torch.diag(torch.tensor([-1.0, 1.0, 1.0], device=g["means"].device, dtype=g["means"].dtype))
+	mirrored["means"] = g["means"] @ flip_x
+
+	# Mirroring an ellipsoid looks the same as turning it 180 degrees about the mirror's normal.
+	half_turn_x = torch.tensor([0.0, 1.0, 0.0, 0.0], device=g["quats"].device)
+	mirrored["quats"] = quat_multiply(half_turn_x, g["quats"])
+	return mirrored
+
+
+def move(g: dict[str, torch.Tensor], rotation: torch.Tensor,
+		 translation: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+	"""Moves every gaussian by one rigid transform and moves the camera with them.
+
+	Args:
+		g: gaussians() output, seen by the identity camera.
+		rotation: [4] unit quaternion (w, x, y, z).
+		translation: [3].
+
+	Returns:
+		The moved gaussians as a new dict, and the [4, 4] world_to_camera that still sees them
+		exactly as the identity camera saw the originals.
+	"""
+	rot = quat_to_rotmat(rotation[None])[0]
+	inv_rot = rot.T
+	inv_t = -inv_rot @ translation
+
+	moved = dict(g)
+	# Points are rows, so we actually apply the transposed rotation.
+	moved["means"] = g["means"] @ inv_rot + translation
+	moved["quats"] = quat_multiply(rotation, g["quats"])
+
+	W = torch.eye(4, device=rotation.device)
+	W[:3, :3] = inv_rot
+	W[:3, 3] = inv_t
+
+	return moved, W
+
+
+@pytest.mark.parametrize("channels", CHANNELS)
+@given(sizes=scene_sizes())
+@torch.no_grad()
+def test_mirrored_scene_renders_mirrored_image(channels, sizes):
+	seed, n, width, height = sizes
+	original = gaussians(seed, n)
+	g = torch.Generator(device="cuda").manual_seed(seed)
+	features = rand(g, n, channels)
+
+	image, feature_image = rasterize(*project(original, width, height), width, height, features=features)
+	mirrored_image, mirrored_feature_image = rasterize(
+		*project(mirror(original), width, height), width, height, features=features)
+
+	# Same math in a different float order, so only close.
+	assert_image_close(mirrored_image, image.flip(1), max_error=FLIP_MAX_ERROR)
+	assert_image_close(mirrored_feature_image, feature_image.flip(1), max_error=FLIP_MAX_ERROR)
+
+
+@pytest.mark.parametrize("channels", CHANNELS)
+@given(sizes=scene_sizes())
+@torch.no_grad()
+def test_moving_scene_and_camera_together_changes_nothing(channels, sizes):
+	seed, n, width, height = sizes
+	original = gaussians(seed, n)
+	g = torch.Generator(device="cuda").manual_seed(seed)
+	features = rand(g, n, channels)
+	rotation = F.normalize(torch.randn(4, generator=g, device="cuda"), dim=0)
+	translation = torch.randn(3, generator=g, device="cuda")
+
+	image, feature_image = rasterize(*project(original, width, height), width, height, features=features)
+	moved, world_to_camera = move(original, rotation, translation)
+	moved_image, moved_feature_image = rasterize(
+		*project(moved, width, height, world_to_camera), width, height, features=features)
+
+	assert_image_close(moved_image, image, max_error=FLIP_MAX_ERROR)
+	assert_image_close(moved_feature_image, feature_image, max_error=FLIP_MAX_ERROR)
+
+
+def test_quat_multiply_composes_rotations():
+	g = torch.Generator().manual_seed(0)
+	q1, q2 = F.normalize(torch.randn(2, 64, 4, generator=g, dtype=torch.float64), dim=-1)
+	torch.testing.assert_close(quat_to_rotmat(quat_multiply(q1, q2)), quat_to_rotmat(q1) @ quat_to_rotmat(q2))
