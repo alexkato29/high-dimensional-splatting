@@ -98,3 +98,22 @@ def test_features_backward_matches_oracle(channels):
 	got = feature_grads(lambda m, c, f, o: rasterize(m, depths, radii, c, colors, o, width, height, features=f)[1])
 	want = feature_grads(lambda m, c, f, o: rasterize_reference(m, depths, radii, c, f, o, width, height))
 	assert_grads_close(("means2D", "conics", "features", "opacities"), got, want)
+
+
+@pytest.mark.parametrize("channels", [32, 64, 128])
+def test_frozen_features_still_backpropagate_into_geometry(channels):
+	width, height = 128, 96
+	means2D, depths, radii, conics, colors, opacities = scene(0, 3000, width, height)
+	g = torch.Generator(device="cuda").manual_seed(3)
+	features = torch.rand(3000, channels, generator=g, device="cuda")
+	grad_features = torch.rand(height, width, channels, generator=g, device="cuda")
+
+	def geometry_grads(render):
+		leaves = [t.detach().clone().requires_grad_(True) for t in (means2D, conics, opacities)]
+		render(*leaves).backward(grad_features)
+		return [t.grad for t in leaves]
+
+	# Features never require grad here, so only the geometry asks for the feature backward.
+	got = geometry_grads(lambda m, c, o: rasterize(m, depths, radii, c, colors, o, width, height, features=features)[1])
+	want = geometry_grads(lambda m, c, o: rasterize_reference(m, depths, radii, c, features, o, width, height))
+	assert_grads_close(("means2D", "conics", "opacities"), got, want)

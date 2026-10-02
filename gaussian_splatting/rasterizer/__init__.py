@@ -144,7 +144,9 @@ class RasterizeGaussians(torch.autograd.Function):
 				height
 			)
 		grad_feats = None
-		if features is not None and ctx.needs_input_grad[7]:
+		# Frozen features still shape the geometry gradients, so any of means2D, conics, opacities or
+		# features needing a gradient runs the feature backward.
+		if features is not None and any(ctx.needs_input_grad[i] for i in (0, 3, 5, 7)):
 			with torch.cuda.nvtx.range("rasterize_features_backward"):
 				grad_feats, feat_means2D, feat_conics, feat_opacities = (
 					_get_rasterizer().rasterize_features_backward(
@@ -154,6 +156,8 @@ class RasterizeGaussians(torch.autograd.Function):
 			grad_means2D += feat_means2D
 			grad_conics += feat_conics
 			grad_opacities += feat_opacities
+			if not ctx.needs_input_grad[7]:
+				grad_feats = None
 		return grad_means2D, None, None, grad_conics, grad_colors, grad_opacities, None, grad_feats, None, None
 
 
