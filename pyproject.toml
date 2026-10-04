@@ -21,9 +21,21 @@ dev = [
     "hypothesis>=6.168.3",
     "pytest ~=8.3.0",
 ]
+bench = [
+    "gsplat; sys_platform == 'linux'",
+]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+gsplat = { git = "https://github.com/nerfstudio-project/gsplat", rev = "28e794ca44a4c25ffc39175370c5ee7b38bfcc36" }
+
+[tool.uv]
+no-build-isolation-package = ["gsplat"]
+
+[[tool.uv.dependency-metadata]]
+name = "gsplat"
+version = "1.6.0"
+requires-dist = ["ninja", "numpy", "jaxtyping", "nvtx", "rich>=12", "torch>=2.7"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
