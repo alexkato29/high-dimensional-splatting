@@ -48,7 +48,7 @@ def assert_grads_close(names: tuple[str, ...], grads: Sequence[torch.Tensor | No
 		assert err <= 2e-3 * scale, f"{name}: max error {err:.2e} of max {scale:.2e}"
 
 
-@pytest.mark.parametrize("channels", [32, 64, 128])
+@pytest.mark.parametrize("channels", [32, 64, 128, 256, 512])
 @torch.no_grad()
 def test_features_forward_matches_oracle(channels):
 	width, height = 128, 96
@@ -65,7 +65,7 @@ def test_features_forward_matches_oracle(channels):
 def test_unsupported_feature_width_is_rejected():
 	width, height = 32, 32
 	inputs = scene(0, 100, width, height)
-	with pytest.raises(RuntimeError, match="32, 64 or 128"):
+	with pytest.raises(RuntimeError, match="32, 64, 128, 256 or 512"):
 		rasterize(*inputs, width, height, features=torch.rand(100, 24, device="cuda"))
 
 
@@ -84,7 +84,8 @@ def test_rgb_matches_oracle():
 	assert_grads_close(("means2D", "conics", "colors", "opacities"), grads, target_grads)
 
 
-@pytest.mark.parametrize("channels, slice_width", [(32, 32), (64, 64), (64, 32), (128, 128), (128, 64), (128, 32)])
+@pytest.mark.parametrize("channels, slice_width", [(32, 32), (64, 64), (64, 32), (128, 128), (128, 64), (128, 32),
+										  (256, 128), (256, 64), (512, 128), (512, 64)])
 def test_features_backward_matches_oracle(channels, slice_width, monkeypatch):
 	monkeypatch.setattr("gaussian_splatting.rasterizer.FEATURE_SLICE_WIDTH", slice_width)
 	width, height = 128, 96

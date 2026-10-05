@@ -1,3 +1,4 @@
+#include <climits>
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include "common.cuh"
@@ -69,7 +70,8 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	__shared__ float2 s_mean[BATCH];
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
-	__shared__ float4 s_feat[BATCH * VEC4_PER_ROW];
+	// BATCH * VEC4_PER_ROW float4s, sized at launch because wide rows pass the 48 KB static cap.
+	extern __shared__ float4 s_feat[];
 
 	uint2 range = tile_ranges[tile_idx];
 	int num_todo = (int)range.y - (int)range.x;
@@ -151,12 +153,11 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 
 	if (inside) {
 		int pixel_idx = py * image_width + px;
-		int plane = image_width * image_height;
 		#pragma unroll
 		for (int i = 0; i < VEC4_PER_LANE; i++) {
 			int channel = 4 * (slice + LANES_PER_PIXEL * i);
-			#pragma unroll
-			for (int e = 0; e < 4; e++) output[(channel + e) * plane + pixel_idx] = acc[4 * i + e];
+			float4* dst = reinterpret_cast<float4*>(&output[pixel_idx * D + channel]);
+			*dst = make_float4(acc[4 * i], acc[4 * i + 1], acc[4 * i + 2], acc[4 * i + 3]);
 		}
 		if (slice == 0) {
 			final_transmittance[pixel_idx] = transmittance;
@@ -172,7 +173,10 @@ static void launch_render_features(int num_tiles, const uint2* tile_ranges, cons
 								   float* final_transmittance, int* n_contrib) {
 	const int blocks = num_tiles * (RENDER_BATCH / PIXELS_PER_BLOCK);
 	const int threads = PIXELS_PER_BLOCK * LANES_PER_PIXEL;
-	render_features<D, LANES_PER_PIXEL, PIXELS_PER_BLOCK, BATCH><<<blocks, threads>>>(
+	const int feature_bytes = BATCH * (D / 4) * sizeof(float4);
+	auto kernel = render_features<D, LANES_PER_PIXEL, PIXELS_PER_BLOCK, BATCH>;
+	cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
+	kernel<<<blocks, threads, feature_bytes>>>(
 		tile_ranges, values_sorted, means2D, conic, color_opacity, features, width, height, output,
 		final_transmittance, n_contrib
 	);
@@ -192,10 +196,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
 				"features must be a contiguous float32 CUDA tensor");
 	const int D = features.size(1);
 	const int num_tiles = ((image_width + TILE_SIZE - 1) / TILE_SIZE) * ((image_height + TILE_SIZE - 1) / TILE_SIZE);
+	// Both feature kernels index the [H, W, D] image with int arithmetic.
+	TORCH_CHECK((int64_t)D * image_width * image_height <= INT_MAX,
+				"a ", image_width, "x", image_height, " image of ", D, " channels overflows the feature kernels' int indices");
 
 	auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 	auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-	torch::Tensor output = torch::empty({D, image_height, image_width}, f32);
+	torch::Tensor output = torch::empty({image_height, image_width, D}, f32);
 	torch::Tensor final_transmittance = torch::empty({image_height, image_width}, f32);
 	torch::Tensor n_contrib = torch::empty({image_height, image_width}, i32);
 
@@ -216,7 +223,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
 		case 32: std::apply(launch_render_features<32, 1, 256, 128>, args); break;
 		case 64: std::apply(launch_render_features<64, 1, 256, 128>, args); break;
 		case 128: std::apply(launch_render_features<128, 2, 128, 64>, args); break;
-		default: TORCH_CHECK(false, "features must have 32, 64 or 128 channels, got ", D);
+		case 256: std::apply(launch_render_features<256, 2, 128, 64>, args); break;
+		case 512: std::apply(launch_render_features<512, 4, 64, 32>, args); break;
+		default: TORCH_CHECK(false, "features must have 32, 64, 128, 256 or 512 channels, got ", D);
 	}
 	check_cuda_error("render_features");
 	return {output, final_transmittance, n_contrib};
@@ -501,6 +510,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 		case 128 * 1000 + 128: std::apply(launch_render_features_backward<128, 128, 128>, args); break;
 		case 128 * 1000 + 64: std::apply(launch_render_features_backward<128, 64, 128>, args); break;
 		case 128 * 1000 + 32: std::apply(launch_render_features_backward<128, 32, 128>, args); break;
+		case 256 * 1000 + 128: std::apply(launch_render_features_backward<256, 128, 128>, args); break;
+		case 256 * 1000 + 64: std::apply(launch_render_features_backward<256, 64, 128>, args); break;
+		case 512 * 1000 + 128: std::apply(launch_render_features_backward<512, 128, 128>, args); break;
+		case 512 * 1000 + 64: std::apply(launch_render_features_backward<512, 64, 128>, args); break;
 		default: TORCH_CHECK(false, "no feature backward for ", D, " channels in slices of ", slice_width);
 	}
 	check_cuda_error("render_features_backward");
