@@ -100,8 +100,10 @@ def render_with_grads(render, inputs: dict[str, torch.Tensor], **kwargs) -> dict
 
 def stats(got: torch.Tensor, want: torch.Tensor) -> str:
 	diff = (got - want).abs().flatten().float()
-	p99 = torch.quantile(diff[torch.randperm(len(diff), device=diff.device)[:2**24]], 0.99)
-	rel_l2 = (got - want).norm() / want.norm().clamp_min(1e-30)
+	# quantile caps at 16M elements, and a permutation of a wide feature tensor alone is over 4 GB.
+	sample = diff if len(diff) <= 2**24 else diff[torch.randint(len(diff), (2**24,), device=diff.device)]
+	p99 = torch.quantile(sample, 0.99)
+	rel_l2 = diff.norm() / want.norm().clamp_min(1e-30)
 	return f"max {diff.max().item():.2e}  p99 {p99.item():.2e}  rel L2 {rel_l2.item():.2e}"
 
 
@@ -236,14 +238,17 @@ def main() -> None:
 			label = f"gsplat D={channels} packed={packed} chunk={chunk} one_call={one_call}"
 			try:
 				theirs = render_with_grads(render_gsplat, inputs, camera=camera, **config)
+				agreed = agrees(theirs, ours, label)
+				# The gate's copy of gsplat's outputs does not fit beside the timed run at D = 512.
+				del theirs
+				if not agreed:
+					continue
+				timing = time_render(render_gsplat, inputs, label, camera=camera, **config)
 			except (RuntimeError, ValueError) as error:
 				print(f"{label} cannot run: {str(error).splitlines()[0]}")
 				continue
-			if not agrees(theirs, ours, label):
-				continue
 			rows.append({"impl": "gsplat", "channels": channels, "config": config,
-						 "pairs": gsplat_pairs(inputs, camera, packed),
-						 **time_render(render_gsplat, inputs, label, camera=camera, **config)})
+						 "pairs": gsplat_pairs(inputs, camera, packed), **timing})
 			print(f"{label} {rows[-1]['fwd']['median_ms']:.2f} / {rows[-1]['bwd']['median_ms']:.2f} ms")
 
 	args.out.write_text(json.dumps({"environment": env, "rows": rows}, indent=1))
