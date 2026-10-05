@@ -27,7 +27,7 @@ def render_and_grads(rasterizer, inputs: tuple, width: int, height: int, backgro
 
 def assert_image_close(got: torch.Tensor, want: torch.Tensor, max_error: float = 2e-3) -> None:
 	diff = (got - want).abs()
-	# kthvalue because quantile refuses more than 16M elements, a D = 32 feature image of Truck is 17M.
+	# kthvalue because quantile refuses more than 16M elements and a D = 32 feature image of Truck is 17M.
 	perc_99 = diff.flatten().kthvalue(max(1, math.ceil(0.99 * diff.numel()))).values
 	assert diff.max() < max_error and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
 
