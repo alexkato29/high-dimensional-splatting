@@ -222,7 +222,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
 	return {output, final_transmittance, n_contrib};
 }
 
-template <int D, int BATCH>
+// Each block owns one tile and WIDTH of its D channels. The geometry gradients are linear in the
+// features, so the slices of a tile add theirs up through the atomics in any order.
+template <int D, int WIDTH, int BATCH>
 __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	const uint2* tile_ranges,
 	const int* values_sorted,
@@ -240,16 +242,20 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	float* grad_features,
 	float* grad_opacities
 ) {
+	constexpr int SLICES = D / WIDTH;
 	constexpr int VEC4_PER_ROW = D / 4;
-	constexpr int CHANNELS_PER_LANE = D / 32;
-	static_assert(D % 32 == 0, "each lane must own the same number of channels");
+	constexpr int VEC4_PER_SLICE = WIDTH / 4;
+	constexpr int CHANNELS_PER_LANE = WIDTH / 32;
+	static_assert(D % WIDTH == 0, "slices must split the channels evenly");
+	static_assert(WIDTH % 32 == 0, "each lane must own the same number of channels");
 	static_assert(BATCH % 32 == 0, "culling tests 32 gaussians per ballot");
 
 	const int tid = threadIdx.x;
 	const int lane = tid & 31;
 	const int warp = tid >> 5;
 
-	const int tile_idx = blockIdx.x;
+	const int tile_idx = blockIdx.x / SLICES;
+	const int channel0 = (blockIdx.x % SLICES) * WIDTH;
 	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 	const int tile_x0 = (tile_idx % tiles_x) * TILE_SIZE;
 	const int tile_y0 = (tile_idx / tiles_x) * TILE_SIZE;
@@ -266,7 +272,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	__shared__ float2 s_mean[BATCH];
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
-	// BATCH * VEC4_PER_ROW float4s, sized at launch because 128 gaussians of 128 channels pass the 48 KB static cap.
+	// BATCH * VEC4_PER_SLICE float4s, sized at launch because 128 gaussians of 128 channels pass the 48 KB static cap.
 	extern __shared__ float4 s_feat4[];
 	__shared__ float s_weight[RENDER_BATCH];
 	__shared__ int s_last_contributor;
@@ -284,7 +290,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 		bool in = x < image_width && y < image_height;
 		#pragma unroll
 		for (int i = 0; i < CHANNELS_PER_LANE; i++)
-			grad[i][p] = in ? grad_output[D * (y * image_width + x) + lane + 32 * i] : 0.0f;
+			grad[i][p] = in ? grad_output[D * (y * image_width + x) + channel0 + lane + 32 * i] : 0.0f;
 	}
 	float transmittance = inside ? final_transmittance[pixel_idx] : 0.0f;
 	int last_contributor = inside ? n_contrib[pixel_idx] : 0;
@@ -314,9 +320,9 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 		}
 
 		__syncthreads();
-		for (int i = tid; i < batch_count * VEC4_PER_ROW; i += RENDER_BATCH) {
-			int k = i / VEC4_PER_ROW;
-			s_feat4[i] = features[(size_t)s_id[k] * VEC4_PER_ROW + (i - k * VEC4_PER_ROW)];
+		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += RENDER_BATCH) {
+			int k = i / VEC4_PER_SLICE;
+			s_feat4[i] = features[(size_t)s_id[k] * VEC4_PER_ROW + (channel0 / 4) + (i - k * VEC4_PER_SLICE)];
 		}
 		__syncthreads();
 
@@ -356,7 +362,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 				// it's summed across lanes w/ a reduce scatter. Afterward, lane p holds the dot for pixel p.
 				float f[CHANNELS_PER_LANE];
 				#pragma unroll
-				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[j * D + lane + 32 * i];
+				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[j * WIDTH + lane + 32 * i];
 				float partial[32];
 				#pragma unroll
 				for (int p = 0; p < 32; p++) {
@@ -424,14 +430,14 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 					for (int p = 0; p < 32; p++) dL_df += w[p] * grad[i][p];
 					// Each lane writes to a different address with CHANNELS_PER_LANE values, so this
 					// atomic is not as heavy hitting as it seems.
-					atomicAdd(&grad_features[(size_t)g * D + lane + 32 * i], dL_df);
+					atomicAdd(&grad_features[(size_t)g * D + channel0 + lane + 32 * i], dL_df);
 				}
 			}
 		}
 	}
 }
 
-template <int D, int BATCH>
+template <int D, int WIDTH, int BATCH>
 static void launch_render_features_backward(int num_tiles, const uint2* tile_ranges, const int* values_sorted,
 											const float2* means2D, const float4* conic,
 											const float4* color_opacity, const float4* features,
@@ -439,9 +445,10 @@ static void launch_render_features_backward(int num_tiles, const uint2* tile_ran
 											const float* grad_output, int width, int height,
 											float* grad_means2D, float* grad_conics, float* grad_features,
 											float* grad_opacities) {
-	const int feature_bytes = BATCH * (D / 4) * sizeof(float4);
-	cudaFuncSetAttribute(render_features_backward<D, BATCH>, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
-	render_features_backward<D, BATCH><<<num_tiles, RENDER_BATCH, feature_bytes>>>(
+	const int feature_bytes = BATCH * (WIDTH / 4) * sizeof(float4);
+	auto kernel = render_features_backward<D, WIDTH, BATCH>;
+	cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
+	kernel<<<num_tiles * (D / WIDTH), RENDER_BATCH, feature_bytes>>>(
 		tile_ranges, values_sorted, means2D, conic, color_opacity, features, final_transmittance, n_contrib,
 		grad_output, width, height, grad_means2D, grad_conics, grad_features, grad_opacities
 	);
@@ -458,7 +465,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 	torch::Tensor final_transmittance,
 	torch::Tensor n_contrib,
 	int image_width,
-	int image_height
+	int image_height,
+	int slice_width
 ) {
 	TORCH_CHECK(grad_output.is_cuda() && grad_output.is_contiguous(), "grad_output must be a contiguous CUDA tensor");
 
@@ -486,11 +494,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 		grad_opacities.data_ptr<float>()
 	);
 
-	switch (D) {
-		case 32: std::apply(launch_render_features_backward<32, 128>, args); break;
-		case 64: std::apply(launch_render_features_backward<64, 128>, args); break;
-		case 128: std::apply(launch_render_features_backward<128, 128>, args); break;
-		default: TORCH_CHECK(false, "features must have 32, 64 or 128 channels, got ", D);
+	switch (D * 1000 + slice_width) {
+		case 32 * 1000 + 32: std::apply(launch_render_features_backward<32, 32, 128>, args); break;
+		case 64 * 1000 + 64: std::apply(launch_render_features_backward<64, 64, 128>, args); break;
+		case 64 * 1000 + 32: std::apply(launch_render_features_backward<64, 32, 128>, args); break;
+		case 128 * 1000 + 128: std::apply(launch_render_features_backward<128, 128, 128>, args); break;
+		case 128 * 1000 + 64: std::apply(launch_render_features_backward<128, 64, 128>, args); break;
+		case 128 * 1000 + 32: std::apply(launch_render_features_backward<128, 32, 128>, args); break;
+		default: TORCH_CHECK(false, "no feature backward for ", D, " channels in slices of ", slice_width);
 	}
 	check_cuda_error("render_features_backward");
 	return {grad_features, grad_means2D, grad_conics, grad_opacities};

@@ -49,7 +49,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 	torch::Tensor final_transmittance,
 	torch::Tensor n_contrib,
 	int image_width,
-	int image_height
+	int image_height,
+	int slice_width
 );
 
 torch::Tensor eval_sh(

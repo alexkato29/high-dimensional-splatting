@@ -84,8 +84,9 @@ def test_rgb_matches_oracle():
 	assert_grads_close(("means2D", "conics", "colors", "opacities"), grads, target_grads)
 
 
-@pytest.mark.parametrize("channels", [32, 64, 128])
-def test_features_backward_matches_oracle(channels):
+@pytest.mark.parametrize("channels, slice_width", [(32, 32), (64, 64), (64, 32), (128, 128), (128, 64), (128, 32)])
+def test_features_backward_matches_oracle(channels, slice_width, monkeypatch):
+	monkeypatch.setattr("gaussian_splatting.rasterizer.FEATURE_SLICE_WIDTH", slice_width)
 	width, height = 128, 96
 	means2D, depths, radii, conics, colors, opacities = scene(0, 3000, width, height)
 	g = torch.Generator(device="cuda").manual_seed(3)

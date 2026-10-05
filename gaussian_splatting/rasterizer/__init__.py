@@ -8,6 +8,9 @@ from gaussian_splatting.rasterizer.projection import project_gaussians  # noqa: 
 
 _rasterizer_module: Any | None = None
 
+# Channels each feature backward block owns. None takes the widest slice, at most 128.
+FEATURE_SLICE_WIDTH: int | None = None
+
 
 def _get_rasterizer() -> Any:
 	"""Compiles the CUDA extension on first use and caches the loaded module.
@@ -151,7 +154,8 @@ class RasterizeGaussians(torch.autograd.Function):
 				grad_feats, feat_means2D, feat_conics, feat_opacities = (
 					_get_rasterizer().rasterize_features_backward(
 						grad_features.contiguous(), features, means2D, conic, color_opacity, values_sorted, tile_ranges,
-						feature_transmittance, feature_contrib, width, height))
+						feature_transmittance, feature_contrib, width, height,
+						FEATURE_SLICE_WIDTH or min(features.shape[1], 128)))
 			# Both images depend on the same geometry, so their gradients add up.
 			grad_means2D += feat_means2D
 			grad_conics += feat_conics
