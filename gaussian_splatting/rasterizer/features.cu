@@ -266,7 +266,8 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	__shared__ float2 s_mean[BATCH];
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
-	__shared__ float4 s_feat4[BATCH * VEC4_PER_ROW];
+	// BATCH * VEC4_PER_ROW float4s, sized at launch because 128 gaussians of 128 channels pass the 48 KB static cap.
+	extern __shared__ float4 s_feat4[];
 	__shared__ float s_weight[RENDER_BATCH];
 	__shared__ int s_last_contributor;
 	const float* s_feat = reinterpret_cast<const float*>(s_feat4);
@@ -438,7 +439,9 @@ static void launch_render_features_backward(int num_tiles, const uint2* tile_ran
 											const float* grad_output, int width, int height,
 											float* grad_means2D, float* grad_conics, float* grad_features,
 											float* grad_opacities) {
-	render_features_backward<D, BATCH><<<num_tiles, RENDER_BATCH>>>(
+	const int feature_bytes = BATCH * (D / 4) * sizeof(float4);
+	cudaFuncSetAttribute(render_features_backward<D, BATCH>, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
+	render_features_backward<D, BATCH><<<num_tiles, RENDER_BATCH, feature_bytes>>>(
 		tile_ranges, values_sorted, means2D, conic, color_opacity, features, final_transmittance, n_contrib,
 		grad_output, width, height, grad_means2D, grad_conics, grad_features, grad_opacities
 	);
@@ -486,7 +489,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 	switch (D) {
 		case 32: std::apply(launch_render_features_backward<32, 128>, args); break;
 		case 64: std::apply(launch_render_features_backward<64, 128>, args); break;
-		case 128: std::apply(launch_render_features_backward<128, 64>, args); break;
+		case 128: std::apply(launch_render_features_backward<128, 128>, args); break;
 		default: TORCH_CHECK(false, "features must have 32, 64 or 128 channels, got ", D);
 	}
 	check_cuda_error("render_features_backward");
