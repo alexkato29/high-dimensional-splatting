@@ -1,12 +1,21 @@
 import argparse
+import itertools
+import json
+import statistics
+import subprocess
+import time
+from pathlib import Path
 
 import gsplat
 import torch
+import torch.nn.functional as F
 
-from gaussian_splatting.rasterizer import project_gaussians, rasterize
+from gaussian_splatting.rasterizer import _get_rasterizer, project_gaussians, rasterize
 from gaussian_splatting.rasterizer.projection import LOW_PASS, NEAR_PLANE
 from gaussian_splatting.utils.dataset import Camera, ColmapDataset
 from gaussian_splatting.utils.gaussian import GaussianModel
+from tests.test_golden import environment
+from tests.test_properties import FLIP_MAX_ERROR
 from tests.test_render import assert_grads_close, assert_image_close
 
 OUTPUTS = ("image", "feature_image")
@@ -14,7 +23,6 @@ LEAVES = ("means", "scales", "quats", "opacities", "colors", "features")
 
 
 def load_model(dataset: ColmapDataset, checkpoint: str) -> GaussianModel:
-	"""Builds a model from a model.pt written by save_checkpoint."""
 	state = torch.load(checkpoint, map_location="cpu")
 	model = GaussianModel(dataset.point_cloud)
 	model.params = {name: torch.nn.Parameter(t.cuda().contiguous()) for name, t in state["params"].items()}
@@ -23,10 +31,6 @@ def load_model(dataset: ColmapDataset, checkpoint: str) -> GaussianModel:
 
 
 def shared_inputs(model: GaussianModel, camera: Camera, channels: int, seed: int = 0) -> dict[str, torch.Tensor]:
-	"""Everything both libraries render from, activated and detached so each run gets fresh leaves.
-
-	Colors come from our SH once and are passed in as plain values, so SH is not part of the comparison.
-	"""
 	g = torch.Generator(device="cuda").manual_seed(seed)
 	with torch.no_grad():
 		_, _, radii, _ = project_gaussians(
@@ -35,10 +39,10 @@ def shared_inputs(model: GaussianModel, camera: Camera, channels: int, seed: int
 		colors = model.colors(camera.center, radii)
 	n = model.means.shape[0]
 	# TODO: Replace this with actual feature vectors
-	return {
+	inputs = {
 		"means": model.means.detach(),
 		"scales": model.scales.detach(),
-		"quats": model.quats.detach(),
+		"quats": model.params["quats"].detach(),
 		"opacities": model.opacities.detach()[:, 0],
 		"colors": colors,
 		"features": torch.rand(n, channels, generator=g, device="cuda"),
@@ -46,27 +50,37 @@ def shared_inputs(model: GaussianModel, camera: Camera, channels: int, seed: int
 		"grad_feature_image": torch.rand(camera.height, camera.width, channels, generator=g, device="cuda"),
 	}
 
+	# 0 channels renders RGB alone.
+	if channels == 0:
+		del inputs["features"], inputs["grad_feature_image"]
+	return inputs
 
-def render_ours(leaves: dict[str, torch.Tensor], camera: Camera) -> tuple[torch.Tensor, torch.Tensor]:
+
+def render_ours(leaves: dict[str, torch.Tensor], camera: Camera) -> tuple[torch.Tensor, ...]:
+	# gsplat normalizes quats inside its projection, though we do not...
 	means2D, depths, radii, conics = project_gaussians(
-		leaves["means"], leaves["scales"], leaves["quats"], leaves["opacities"][:, None], camera.world_to_camera,
-		camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height)
-	return rasterize(means2D, depths, radii, conics, leaves["colors"], leaves["opacities"][:, None],
-					 camera.width, camera.height, features=leaves["features"])
+		leaves["means"], leaves["scales"], F.normalize(leaves["quats"], dim=-1), leaves["opacities"][:, None],
+		camera.world_to_camera, camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height)
+	out = rasterize(means2D, depths, radii, conics, leaves["colors"], leaves["opacities"][:, None],
+					camera.width, camera.height, features=leaves.get("features"))
+	return out if isinstance(out, tuple) else (out,)
 
 
 def render_gsplat(leaves: dict[str, torch.Tensor], camera: Camera, channel_chunk: int = 32,
-				  one_call: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-	"""gsplat with our near plane and low pass filter, either one call over RGB + features or one call each."""
+				  one_call: bool = False, packed: bool = True) -> tuple[torch.Tensor, ...]:
 	K = torch.tensor([[camera.fx, 0, camera.cx], [0, camera.fy, camera.cy], [0, 0, 1]], device="cuda")
 
 	def call(values: torch.Tensor) -> torch.Tensor:
 		out, _, _ = gsplat.rasterization(
 			leaves["means"], leaves["quats"], leaves["scales"], leaves["opacities"], values,
 			camera.world_to_camera[None], K[None], camera.width, camera.height,
-			near_plane=NEAR_PLANE, eps2d=LOW_PASS, channel_chunk=channel_chunk)
+			near_plane=NEAR_PLANE, eps2d=LOW_PASS, channel_chunk=channel_chunk, packed=packed)
 		return out[0]
 
+	# `one_call` is supported just to ensure that our two individual rasters (of features and rgb separately)
+	# does not lose to a single unified render case in gsplat.
+	if "features" not in leaves:
+		return (call(leaves["colors"]),)
 	if one_call:
 		out = call(torch.cat([leaves["colors"], leaves["features"]], dim=1))
 		return out[..., :3], out[..., 3:]
@@ -74,11 +88,10 @@ def render_gsplat(leaves: dict[str, torch.Tensor], camera: Camera, channel_chunk
 
 
 def render_with_grads(render, inputs: dict[str, torch.Tensor], **kwargs) -> dict[str, torch.Tensor]:
-	"""One render and backward through `render`, returning both images and the gradient of every leaf."""
-	leaves = {name: inputs[name].clone().requires_grad_(True) for name in LEAVES}
-	image, feature_image = render(leaves, **kwargs)
-	torch.autograd.backward((image, feature_image), (inputs["grad_image"], inputs["grad_feature_image"]))
-	out = {"image": image.detach(), "feature_image": feature_image.detach()}
+	leaves = {name: inputs[name].clone().requires_grad_(True) for name in LEAVES if name in inputs}
+	images = render(leaves, **kwargs)
+	torch.autograd.backward(images, [inputs[f"grad_{name}"] for name in OUTPUTS[:len(images)]])
+	out = {name: image.detach() for name, image in zip(OUTPUTS, images)}
 	for name, leaf in leaves.items():
 		assert leaf.grad is not None, f"{name}: no gradient"
 		out[f"grad_{name}"] = leaf.grad
@@ -93,11 +106,104 @@ def stats(got: torch.Tensor, want: torch.Tensor) -> str:
 
 
 def assert_agree(name: str, got: torch.Tensor, want: torch.Tensor) -> None:
-	"""Refuses to let a timing run start when gsplat and ours disagree on one output or gradient."""
 	if name.endswith(OUTPUTS):
-		assert_image_close(got, want)
+		assert_image_close(got, want, max_error=FLIP_MAX_ERROR)
 	else:
 		assert_grads_close((name,), [got], [want])
+
+
+def power_cap_us() -> int:
+	out = subprocess.run(["nvidia-smi", "-q", "-d", "PERFORMANCE"], capture_output=True, text=True, check=True).stdout
+	for line in out.splitlines():
+		if "SW Power Capping" in line and line.strip().endswith("us"):
+			return int(line.split()[-2])
+	return -1
+
+
+def sm_clock_mhz() -> int:
+	out = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm", "--format=csv,noheader,nounits"],
+						 capture_output=True, text=True, check=True).stdout
+	return int(out.split()[0])
+
+
+def time_ms(fn, before=None, iters: int = 50, warmup: int = 10) -> dict[str, float]:
+	for _ in range(warmup):
+		if before:
+			before()
+		fn()
+	torch.cuda.synchronize()
+	time.sleep(0.5)
+	cap, clock = power_cap_us(), sm_clock_mhz()
+	times = []
+	for _ in range(iters):
+		if before:
+			before()
+		torch.cuda.synchronize()
+		start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+		start.record()
+		fn()
+		end.record()
+		end.synchronize()
+		times.append(start.elapsed_time(end))
+		time.sleep(max(0.01, 1.5 * times[-1] / 1000))
+	return {"median_ms": statistics.median(times), "min_ms": min(times), "max_ms": max(times),
+			"power_capped_us": power_cap_us() - cap, "sm_clock_mhz_start": clock, "sm_clock_mhz_end": sm_clock_mhz()}
+
+
+def time_render(render, inputs: dict[str, torch.Tensor], label: str, **kwargs) -> dict[str, dict[str, float]]:
+	leaves = {name: inputs[name].clone().requires_grad_(True) for name in LEAVES if name in inputs}
+	grads = [inputs[f"grad_{name}"] for name in OUTPUTS if f"grad_{name}" in inputs]
+	state = {}
+
+	def forward():
+		state["out"] = render(leaves, **kwargs)
+
+	def backward():
+		torch.autograd.backward(state["out"], grads)
+
+	def reset():
+		for leaf in leaves.values():
+			leaf.grad = None
+		forward()
+
+	with torch.cuda.nvtx.range(f"{label} fwd"):
+		fwd = time_ms(forward)
+	with torch.cuda.nvtx.range(f"{label} bwd"):
+		bwd = time_ms(backward, before=reset)
+	return {"fwd": fwd, "bwd": bwd}
+
+
+def ours_pairs(inputs: dict[str, torch.Tensor], camera: Camera) -> int:
+	with torch.no_grad():
+		means2D, depths, radii, conics = project_gaussians(
+			inputs["means"], inputs["scales"], F.normalize(inputs["quats"], dim=-1), inputs["opacities"][:, None],
+			camera.world_to_camera, camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height)
+		out = _get_rasterizer().rasterize(means2D, depths, radii, conics, inputs["colors"],
+										  inputs["opacities"][:, None], torch.zeros(3, device="cuda"),
+										  camera.width, camera.height)
+	return out[3].numel()
+
+
+def gsplat_pairs(inputs: dict[str, torch.Tensor], camera: Camera, packed: bool) -> int:
+	K = torch.tensor([[camera.fx, 0, camera.cx], [0, camera.fy, camera.cy], [0, 0, 1]], device="cuda")
+	with torch.no_grad():
+		_, _, meta = gsplat.rasterization(
+			inputs["means"], inputs["quats"], inputs["scales"], inputs["opacities"], inputs["colors"],
+			camera.world_to_camera[None], K[None], camera.width, camera.height,
+			near_plane=NEAR_PLANE, eps2d=LOW_PASS, packed=packed)
+	return meta["flatten_ids"].numel()
+
+
+def agrees(theirs: dict[str, torch.Tensor], ours: dict[str, torch.Tensor], label: str) -> bool:
+	for name, want in ours.items():
+		print(f"{label} {name:24s} {stats(theirs[name], want)}")
+	try:
+		for name, want in ours.items():
+			assert_agree(name, theirs[name], want)
+	except AssertionError as error:
+		print(f"{label} DISAGREES, not timed: {error}")
+		return False
+	return True
 
 
 def main() -> None:
@@ -105,24 +211,54 @@ def main() -> None:
 	parser.add_argument("scene", help="COLMAP scene folder")
 	parser.add_argument("checkpoint", help="model.pt written by save_checkpoint")
 	parser.add_argument("--view", type=int, default=0, help="index into the training cameras")
-	parser.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128])
+	parser.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128], help="feature widths, 0 for RGB alone")
+	parser.add_argument("--out", type=Path, default=Path("bench_results.json"))
 	args = parser.parse_args()
 
 	dataset = ColmapDataset(args.scene)
 	model = load_model(dataset, args.checkpoint)
 	camera = dataset.train_cameras[args.view]
-	print(f"gsplat {gsplat.__version__}, torch {torch.__version__}, {torch.cuda.get_device_name()}")
-	print(f"{model.means.shape[0]} gaussians, view {camera.name} {camera.width}x{camera.height}")
+	env = {**environment(), "gsplat": gsplat.__version__, "scene": args.scene, "checkpoint": args.checkpoint,
+		   "view": camera.name, "width": camera.width, "height": camera.height, "gaussians": model.means.shape[0]}
+	print(env)
 
+	rows = []
 	for channels in args.channels:
 		inputs = shared_inputs(model, camera, channels)
 		ours = render_with_grads(render_ours, inputs, camera=camera)
-		theirs = render_with_grads(render_gsplat, inputs, camera=camera)
-		for name in ours:
-			print(f"D={channels} {name:24s} {stats(theirs[name], ours[name])}")
-		for name in ours:
-			assert_agree(f"D={channels} {name}", theirs[name], ours[name])
-		print(f"D={channels} agrees")
+		rows.append({"impl": "ours", "channels": channels, "config": {}, "pairs": ours_pairs(inputs, camera),
+					 **time_render(render_ours, inputs, f"ours D={channels}", camera=camera)})
+		print(f"D={channels} ours {rows[-1]['fwd']['median_ms']:.2f} / {rows[-1]['bwd']['median_ms']:.2f} ms")
+
+		chunks, calls = ((32, 64, 128), (False, True)) if channels else ((32,), (False,))
+		for packed, chunk, one_call in itertools.product((True, False), chunks, calls):
+			config = {"packed": packed, "channel_chunk": chunk, "one_call": one_call}
+			label = f"gsplat D={channels} packed={packed} chunk={chunk} one_call={one_call}"
+			try:
+				theirs = render_with_grads(render_gsplat, inputs, camera=camera, **config)
+			except (RuntimeError, ValueError) as error:
+				print(f"{label} cannot run: {str(error).splitlines()[0]}")
+				continue
+			if not agrees(theirs, ours, label):
+				continue
+			rows.append({"impl": "gsplat", "channels": channels, "config": config,
+						 "pairs": gsplat_pairs(inputs, camera, packed),
+						 **time_render(render_gsplat, inputs, label, camera=camera, **config)})
+			print(f"{label} {rows[-1]['fwd']['median_ms']:.2f} / {rows[-1]['bwd']['median_ms']:.2f} ms")
+
+	args.out.write_text(json.dumps({"environment": env, "rows": rows}, indent=1))
+	for channels in args.channels:
+		mine = next(r for r in rows if r["impl"] == "ours" and r["channels"] == channels)
+		theirs = [r for r in rows if r["impl"] == "gsplat" and r["channels"] == channels]
+		if not theirs:
+			print(f"D={channels}: no gsplat configuration agreed")
+			continue
+		for direction in ("fwd", "bwd"):
+			best = min(theirs, key=lambda r: r[direction]["median_ms"])
+			ratio = best[direction]["median_ms"] / mine[direction]["median_ms"]
+			print(f"D={channels} {direction}: ours {mine[direction]['median_ms']:.2f} ms, best gsplat "
+				  f"{best[direction]['median_ms']:.2f} ms {best['config']}, {ratio:.2f}x")
+	print(f"wrote {args.out}")
 
 
 if __name__ == "__main__":
