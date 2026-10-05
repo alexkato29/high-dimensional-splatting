@@ -260,7 +260,6 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	const float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 	const int pixel_idx = py * image_width + px;
 
-	const int plane = image_width * image_height;
 	const float4 rect = warp_rect(pixel);
 
 	__shared__ int s_id[BATCH];
@@ -284,7 +283,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 		bool in = x < image_width && y < image_height;
 		#pragma unroll
 		for (int i = 0; i < CHANNELS_PER_LANE; i++)
-			grad[i][p] = in ? grad_output[(lane + 32 * i) * plane + y * image_width + x] : 0.0f;
+			grad[i][p] = in ? grad_output[D * (y * image_width + x) + lane + 32 * i] : 0.0f;
 	}
 	float transmittance = inside ? final_transmittance[pixel_idx] : 0.0f;
 	int last_contributor = inside ? n_contrib[pixel_idx] : 0;

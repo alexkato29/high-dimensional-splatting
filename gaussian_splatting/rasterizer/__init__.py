@@ -150,8 +150,8 @@ class RasterizeGaussians(torch.autograd.Function):
 			with torch.cuda.nvtx.range("rasterize_features_backward"):
 				grad_feats, feat_means2D, feat_conics, feat_opacities = (
 					_get_rasterizer().rasterize_features_backward(
-						grad_features.permute(2, 0, 1).contiguous(), features, means2D, conic, color_opacity,
-						values_sorted, tile_ranges, feature_transmittance, feature_contrib, width, height))
+						grad_features.contiguous(), features, means2D, conic, color_opacity, values_sorted, tile_ranges,
+						feature_transmittance, feature_contrib, width, height))
 			# Both images depend on the same geometry, so their gradients add up.
 			grad_means2D += feat_means2D
 			grad_conics += feat_conics
