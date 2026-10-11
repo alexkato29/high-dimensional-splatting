@@ -54,8 +54,6 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	const int lane = tid & 31;
 	const int slice = tid % LANES_PER_PIXEL;
 
-	// We use LANES_PER_PIXEL to avoid register pressure. As D increases, # of registers required to
-	// keep the running sums rapidly reduces occupancy and hurts performance.
 	const int local_pixel = (blockIdx.x % BLOCKS_PER_TILE) * PIXELS_PER_BLOCK + tid / LANES_PER_PIXEL;
 	const int tile_idx = blockIdx.x / BLOCKS_PER_TILE;
 	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
@@ -70,13 +68,11 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	__shared__ float2 s_mean[BATCH];
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
-	// BATCH * VEC4_PER_ROW float4s, sized at launch because wide rows pass the 48 KB static cap.
 	extern __shared__ float4 s_feat[];
 
 	uint2 range = tile_ranges[tile_idx];
 	int num_todo = (int)range.y - (int)range.x;
 
-	// Arrays only live in registers if every index is a compile time constant, thus the unroll.
 	float acc[VEC4_PER_LANE * 4];
 	#pragma unroll
 	for (int i = 0; i < VEC4_PER_LANE * 4; i++) acc[i] = 0.0f;
@@ -85,43 +81,38 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	bool done = !inside;
 	int last_contributor = 0;
 
-	// We process the gaussians in batches so we can stage them in shared memory.
 	for (int batch_start = 0; batch_start < num_todo; batch_start += BATCH) {
-		// Doubles as the barrier protecting last batch's shared memory reads from this batch's writes.
 		if (__syncthreads_count(done) == THREADS) break;
 
 		int batch_count = min(BATCH, num_todo - batch_start);
 		for (int i = tid; i < batch_count; i += THREADS) {
-			int g = values_sorted[range.x + batch_start + i];
-			s_id[i] = g;
-			s_mean[i] = means2D[g];
-			float4 c = conic[g];
-			float opacity = color_opacity[g].w;
+			int gaussian_id = values_sorted[range.x + batch_start + i];
+			s_id[i] = gaussian_id;
+			s_mean[i] = means2D[gaussian_id];
+			float4 c = conic[gaussian_id];
+			float opacity = color_opacity[gaussian_id].w;
 			s_conic[i] = make_float4(c.x, c.y, c.z, opacity);
 			s_extent[i] = culling_extent(c, opacity);
 		}
 		__syncthreads();
 		for (int i = tid; i < batch_count * VEC4_PER_ROW; i += THREADS) {
-			int k = i / VEC4_PER_ROW;
-			s_feat[i] = features[(size_t)s_id[k] * VEC4_PER_ROW + (i - k * VEC4_PER_ROW)];
+			int slot = i / VEC4_PER_ROW;
+			s_feat[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + (i - slot * VEC4_PER_ROW)];
 		}
 		__syncthreads();
 
-		// We cull gaussians at the warp level since some gaussians, while in a given warp's tile, might not touch
-		// any of the given warp's actual pixels.
-		for (int j0 = 0; j0 < batch_count; j0 += 32) {
+		for (int group_start = 0; group_start < batch_count; group_start += 32) {
 			if (__all_sync(FULL_MASK, done)) break;
-			int jl = j0 + lane;
-			// Bit j of mask is 1 if the gaussian at j0 + j touches at least one pixel in this warp's rectangle.
-			unsigned mask = __ballot_sync(FULL_MASK, jl < batch_count && box_hits(s_mean[jl], s_extent[jl], rect));
+			int candidate = group_start + lane;
+			unsigned mask = __ballot_sync(FULL_MASK, candidate < batch_count && box_hits(s_mean[candidate], s_extent[candidate], rect));
 			while (mask) {
-				int j = j0 + __ffs(mask) - 1;
+				int slot = group_start + __ffs(mask) - 1;
 				mask &= mask - 1;
 
 				if (done) continue;
 
-				float2 mean = s_mean[j];
-				float4 c = s_conic[j];
+				float2 mean = s_mean[slot];
+				float4 c = s_conic[slot];
 				float dx = pixel.x - mean.x;
 				float dy = pixel.y - mean.y;
 
@@ -136,7 +127,7 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 				}
 
 				float w = alpha * transmittance;
-				const float4* row = &s_feat[j * VEC4_PER_ROW + slice];
+				const float4* row = &s_feat[slot * VEC4_PER_ROW + slice];
 				#pragma unroll
 				for (int i = 0; i < VEC4_PER_LANE; i++) {
 					float4 f = row[i * LANES_PER_PIXEL];
@@ -146,7 +137,7 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 					acc[4 * i + 3] += w * f.w;
 				}
 				transmittance = test_transmittance;
-				last_contributor = batch_start + j + 1;
+				last_contributor = batch_start + slot + 1;
 			}
 		}
 	}
@@ -271,7 +262,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 
 	const int px = tile_x0 + tid % TILE_SIZE;
 	const int py = tile_y0 + tid / TILE_SIZE;
-	const bool inside = px < image_width && py < image_height;
+	const bool pixel_inside = px < image_width && py < image_height;
 	const float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 	const int pixel_idx = py * image_width + px;
 
@@ -281,16 +272,11 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	__shared__ float2 s_mean[BATCH];
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
-	// BATCH * VEC4_PER_SLICE float4s, sized at launch because 128 gaussians of 128 channels pass the 48 KB static cap.
 	extern __shared__ float4 s_feat4[];
 	__shared__ float s_weight[RENDER_BATCH];
 	__shared__ int s_last_contributor;
 	const float* s_feat = reinterpret_cast<const float*>(s_feat4);
 
-	// Cooperatively load dL/dpixel into registers s.t. each thread grabs multiple channels of each pixel.
-	// grad[i][p] is dL/dpixel for channel lane + 32*i of the warp's pixel p. Remember that, when D >= 1,
-	// we render two images of shape [H, W, 3] (the rgb image) and [H, W, D] (the feature map). We are,
-	// in this kernel, only concerned with pixels from the second.
 	float grad[CHANNELS_PER_LANE][32];
 	#pragma unroll
 	for (int p = 0; p < 32; p++) {
@@ -301,10 +287,10 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 		for (int i = 0; i < CHANNELS_PER_LANE; i++)
 			grad[i][p] = in ? grad_output[D * (y * image_width + x) + channel0 + lane + 32 * i] : 0.0f;
 	}
-	float transmittance = inside ? final_transmittance[pixel_idx] : 0.0f;
-	int last_contributor = inside ? n_contrib[pixel_idx] : 0;
+	float transmittance = pixel_inside ? final_transmittance[pixel_idx] : 0.0f;
+	int last_contributor = pixel_inside ? n_contrib[pixel_idx] : 0;
 
-	// Start below the block's deepest contributor, as render_gaussians_backward does.
+	// We can skip any gaussians that no pixel in the block will ever touch.
 	uint2 range = tile_ranges[tile_idx];
 	if (tid == 0) s_last_contributor = 0;
 	__syncthreads();
@@ -312,51 +298,44 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	__syncthreads();
 	int num_todo = min((int)range.y - (int)range.x, s_last_contributor);
 
-	float rec = 0.0f;
+	float behind_dot = 0.0f;
 	for (int batch_end = num_todo; batch_end > 0; batch_end -= BATCH) {
 		int batch_count = min(BATCH, batch_end);
 		int batch_start = batch_end - batch_count;
 
 		__syncthreads();
 		for (int i = tid; i < batch_count; i += RENDER_BATCH) {
-			int g = values_sorted[range.x + batch_start + i];
-			s_id[i] = g;
-			s_mean[i] = means2D[g];
-			float4 c = conic[g];
-			float opacity = color_opacity[g].w;
+			int gaussian_id = values_sorted[range.x + batch_start + i];
+			s_id[i] = gaussian_id;
+			s_mean[i] = means2D[gaussian_id];
+			float4 c = conic[gaussian_id];
+			float opacity = color_opacity[gaussian_id].w;
 			s_conic[i] = make_float4(c.x, c.y, c.z, opacity);
 			s_extent[i] = culling_extent(c, opacity);
 		}
 
 		__syncthreads();
 		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += RENDER_BATCH) {
-			int k = i / VEC4_PER_SLICE;
-			s_feat4[i] = features[(size_t)s_id[k] * VEC4_PER_ROW + (channel0 / 4) + (i - k * VEC4_PER_SLICE)];
+			int slot = i / VEC4_PER_SLICE;
+			s_feat4[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + (channel0 / 4) + (i - slot * VEC4_PER_SLICE)];
 		}
 		__syncthreads();
 
-		// Walk the batch back to front. (batch_count - 1) / 32 * 32 rounds down to the closest smaller
-		// multiple of 32 so each lane has a
-		for (int j0 = (batch_count - 1) / 32 * 32; j0 >= 0; j0 -= 32) {
-			int jl = j0 + lane;
-
-			// Each thread owns a set of channels from each gaussian. Thus, each thread must know if each
-			// gaussian is active (thus why a ballot sync is required).
-			unsigned mask = __ballot_sync(FULL_MASK, jl < batch_count && box_hits(s_mean[jl], s_extent[jl], rect));
+		for (int group_start = (batch_count - 1) / 32 * 32; group_start >= 0; group_start -= 32) {
+			int candidate = group_start + lane;
+			unsigned mask = __ballot_sync(FULL_MASK, candidate < batch_count && box_hits(s_mean[candidate], s_extent[candidate], rect));
 			while (mask) {
-			    // Find the deepest gaussian in our mask, then flip it to a zero to mark it as visited.
 				int bit = 31 - __clz(mask);
 				mask &= ~(1u << bit);
-				int j = j0 + bit;
+				int slot = group_start + bit;
 
-				// Skip out of bounds pixels or too deep of gaussians.
-				bool contributes = inside && batch_start + j < last_contributor;
+				bool contributes = pixel_inside && batch_start + slot < last_contributor;
 				float alpha = 0.0f, gauss = 0.0f, raw_alpha = 0.0f, dx = 0.0f, dy = 0.0f;
-				float4 c = s_conic[j];
+				float4 c = s_conic[slot];
 
 				// Skip gaussians that don't influence the thread's associated pixel.
 				if (contributes) {
-					float2 mean = s_mean[j];
+					float2 mean = s_mean[slot];
 					dx = pixel.x - mean.x;
 					dy = pixel.y - mean.y;
 					float mahalanobis = dx * (c.x * dx + c.y * dy) + dy * (c.y * dx + c.z * dy);
@@ -367,38 +346,34 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 				}
 				if (!__any_sync(FULL_MASK, contributes)) continue;
 
-				// f \dot dL/dpixel for all 32 pixels. Each lane computes its partial over its channels, then
-				// it's summed across lanes w/ a reduce scatter. Afterward, lane p holds the dot for pixel p.
 				float f[CHANNELS_PER_LANE];
 				#pragma unroll
-				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[j * WIDTH + lane + 32 * i];
+				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[slot * WIDTH + lane + 32 * i];
 				float partial[32];
 				#pragma unroll
-				for (int p = 0; p < 32; p++) {
-					partial[p] = 0.0f;
+				for (int px = 0; px < 32; px++) {
+					partial[px] = 0.0f;
 					#pragma unroll
-					for (int i = 0; i < CHANNELS_PER_LANE; i++) partial[p] += f[i] * grad[i][p];
+					for (int i = 0; i < CHANNELS_PER_LANE; i++) partial[px] += f[i] * grad[i][px];
 				}
 				float dot = reduce_scatter<32, 32>(partial, lane);
 
-				// Compute dL/dAlpha, which the derivatives of opacity/means/conics depend on.
 				float dL_dalpha = 0.0f;
 				float weight = 0.0f;
 				if (contributes) {
 					float inv_one_minus_alpha = __fdividef(1.0f, 1.0f - alpha);
 					transmittance *= inv_one_minus_alpha;
 					weight = transmittance * alpha;
-					dL_dalpha = transmittance * (dot - rec);
-					rec = alpha * dot + (1.0f - alpha) * rec;
+					dL_dalpha = transmittance * (dot - behind_dot);
+					behind_dot = alpha * dot + (1.0f - alpha) * behind_dot;
 				}
 
 				// Compute the partials of opacity, means, and conics for the gaussian wrt each pixel.
 				// Last two elements of v are never used and exist purely as padding for reduce scatter,
 				// which mandates the input value contain a power of two elements.
 				float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-				// A clamped alpha no longer depends on the gaussian so nothing flows past it.
+				// A clamped alpha no longer depends on the gaussian, so nothing flows past it.
 				if (contributes && raw_alpha <= MAX_ALPHA) {
-				    // c.w is opacity.
 					float dL_dG = c.w * dL_dalpha;
 					v[0] = gauss * dL_dalpha;
 
@@ -410,18 +385,15 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 					v[5] = dL_dG * gauss * -0.5f * dy * dy;
 				}
 
-				// Total holds all partial derivates summed across the whole warp. for 0<=k<=5, each
-				// lane 4k to 4k + 3 holds one of the derivatives. They're repeated since the
-				// reduce scatter is undersaturated given its template parameters.
 				float total = reduce_scatter<8, 32>(v, lane);
 				int k = lane >> 2;
 
-				int g = s_id[j];
-				// k = 6, 7 will have no values because they were purely for padding the reduce scatter.
+				int gaussian_id = s_id[slot];
+				// Again, k = 6, 7 will have no values because they were purely for padding the reduce scatter.
 				if ((lane & 3) == 0 && k < 6) {
-					float* dst = k == 0 ? &grad_opacities[g]
-							   : k < 3 ? &grad_means2D[g * 2 + (k - 1)]
-							   : &grad_conics[g * 3 + (k - 3)];
+					float* dst = k == 0 ? &grad_opacities[gaussian_id]
+							   : k < 3 ? &grad_means2D[gaussian_id * 2 + (k - 1)]
+							   : &grad_conics[gaussian_id * 3 + (k - 3)];
 					atomicAdd(dst, total);
 				}
 
@@ -437,9 +409,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 					float dL_df = 0.0f;
 					#pragma unroll
 					for (int p = 0; p < 32; p++) dL_df += w[p] * grad[i][p];
-					// Each lane writes to a different address with CHANNELS_PER_LANE values, so this
-					// atomic is not as heavy hitting as it seems.
-					atomicAdd(&grad_features[(size_t)g * D + channel0 + lane + 32 * i], dL_df);
+					atomicAdd(&grad_features[(size_t)gaussian_id * D + channel0 + lane + 32 * i], dL_df);
 				}
 			}
 		}
