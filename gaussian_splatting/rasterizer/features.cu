@@ -27,8 +27,8 @@ __device__ inline float4 warp_rect(float2 pixel) {
 					   __shfl_sync(FULL_MASK, pixel.y, 0), __shfl_sync(FULL_MASK, pixel.y, 31));
 }
 
-template <int D, int LANES_PER_PIXEL, int PIXELS_PER_BLOCK, int BATCH>
-__global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_features(
+template <int D, int BATCH, int WIDTH>
+__global__ void __launch_bounds__(RENDER_BATCH) render_features(
 	const uint2* tile_ranges,
 	const int* values_sorted,
 	const float2* means2D,
@@ -42,24 +42,20 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	int* n_contrib
 ) {
 	constexpr int VEC4_PER_ROW = D / 4;
-	constexpr int VEC4_PER_LANE = VEC4_PER_ROW / LANES_PER_PIXEL;
-	constexpr int THREADS = PIXELS_PER_BLOCK * LANES_PER_PIXEL;
-	constexpr int BLOCKS_PER_TILE = RENDER_BATCH / PIXELS_PER_BLOCK;
-	static_assert(D % 4 == 0 && VEC4_PER_ROW % LANES_PER_PIXEL == 0, "each lane must own whole float4s");
+	constexpr int VEC4_PER_SLICE = WIDTH / 4;
+	constexpr int SLICES = D / WIDTH;
+	static_assert(D % WIDTH == 0 && WIDTH % 4 == 0, "slices must split the channels into whole float4s");
 	static_assert(BATCH % 32 == 0, "culling tests 32 gaussians per ballot");
-	static_assert(RENDER_BATCH % PIXELS_PER_BLOCK == 0, "blocks must split a tile evenly");
-	static_assert(PIXELS_PER_BLOCK % TILE_SIZE == 0, "blocks must cover whole tile rows");
 
 	const int tid = threadIdx.x;
 	const int lane = tid & 31;
-	const int slice = tid % LANES_PER_PIXEL;
 
-	const int local_pixel = (blockIdx.x % BLOCKS_PER_TILE) * PIXELS_PER_BLOCK + tid / LANES_PER_PIXEL;
-	const int tile_idx = blockIdx.x / BLOCKS_PER_TILE;
+	const int tile_idx = blockIdx.x / SLICES;
+	const int channel0 = (blockIdx.x % SLICES) * WIDTH;
 	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 
-	const int px = (tile_idx % tiles_x) * TILE_SIZE + local_pixel % TILE_SIZE;
-	const int py = (tile_idx / tiles_x) * TILE_SIZE + local_pixel / TILE_SIZE;
+	const int px = (tile_idx % tiles_x) * TILE_SIZE + tid % TILE_SIZE;
+	const int py = (tile_idx / tiles_x) * TILE_SIZE + tid / TILE_SIZE;
 	const bool inside = px < image_width && py < image_height;
 	const float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 	const float4 rect = warp_rect(pixel);
@@ -73,19 +69,19 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	uint2 range = tile_ranges[tile_idx];
 	int num_todo = (int)range.y - (int)range.x;
 
-	float acc[VEC4_PER_LANE * 4];
+	float acc[WIDTH];
 	#pragma unroll
-	for (int i = 0; i < VEC4_PER_LANE * 4; i++) acc[i] = 0.0f;
+	for (int i = 0; i < WIDTH; i++) acc[i] = 0.0f;
 
 	float transmittance = 1.0f;
 	bool done = !inside;
 	int last_contributor = 0;
 
 	for (int batch_start = 0; batch_start < num_todo; batch_start += BATCH) {
-		if (__syncthreads_count(done) == THREADS) break;
+		if (__syncthreads_count(done) == RENDER_BATCH) break;
 
 		int batch_count = min(BATCH, num_todo - batch_start);
-		for (int i = tid; i < batch_count; i += THREADS) {
+		for (int i = tid; i < batch_count; i += RENDER_BATCH) {
 			int gaussian_id = values_sorted[range.x + batch_start + i];
 			s_id[i] = gaussian_id;
 			s_mean[i] = means2D[gaussian_id];
@@ -95,9 +91,9 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 			s_extent[i] = culling_extent(c, opacity);
 		}
 		__syncthreads();
-		for (int i = tid; i < batch_count * VEC4_PER_ROW; i += THREADS) {
-			int slot = i / VEC4_PER_ROW;
-			s_feat[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + (i - slot * VEC4_PER_ROW)];
+		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += RENDER_BATCH) {
+			int slot = i / VEC4_PER_SLICE;
+			s_feat[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + channel0 / 4 + i % VEC4_PER_SLICE];
 		}
 		__syncthreads();
 
@@ -127,10 +123,10 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 				}
 
 				float w = alpha * transmittance;
-				const float4* row = &s_feat[slot * VEC4_PER_ROW + slice];
+				const float4* row = &s_feat[slot * VEC4_PER_SLICE];
 				#pragma unroll
-				for (int i = 0; i < VEC4_PER_LANE; i++) {
-					float4 f = row[i * LANES_PER_PIXEL];
+				for (int i = 0; i < VEC4_PER_SLICE; i++) {
+					float4 f = row[i];
 					acc[4 * i + 0] += w * f.x;
 					acc[4 * i + 1] += w * f.y;
 					acc[4 * i + 2] += w * f.z;
@@ -145,29 +141,28 @@ __global__ void __launch_bounds__(PIXELS_PER_BLOCK * LANES_PER_PIXEL) render_fea
 	if (inside) {
 		int pixel_idx = py * image_width + px;
 		#pragma unroll
-		for (int i = 0; i < VEC4_PER_LANE; i++) {
-			int channel = 4 * (slice + LANES_PER_PIXEL * i);
+		for (int i = 0; i < VEC4_PER_SLICE; i++) {
+			int channel = channel0 + i * 4;
 			float4* dst = reinterpret_cast<float4*>(&output[pixel_idx * D + channel]);
 			*dst = make_float4(acc[4 * i], acc[4 * i + 1], acc[4 * i + 2], acc[4 * i + 3]);
 		}
-		if (slice == 0) {
+		if (blockIdx.x % SLICES == 0) {
 			final_transmittance[pixel_idx] = transmittance;
 			n_contrib[pixel_idx] = last_contributor;
 		}
 	}
 }
 
-template <int D, int LANES_PER_PIXEL, int PIXELS_PER_BLOCK, int BATCH>
+template <int D, int BATCH, int WIDTH>
 static void launch_render_features(int num_tiles, const uint2* tile_ranges, const int* values_sorted,
 								   const float2* means2D, const float4* conic, const float4* color_opacity,
 								   const float4* features, int width, int height, float* output,
 								   float* final_transmittance, int* n_contrib) {
-	const int blocks = num_tiles * (RENDER_BATCH / PIXELS_PER_BLOCK);
-	const int threads = PIXELS_PER_BLOCK * LANES_PER_PIXEL;
-	const int feature_bytes = BATCH * (D / 4) * sizeof(float4);
-	auto kernel = render_features<D, LANES_PER_PIXEL, PIXELS_PER_BLOCK, BATCH>;
+	const int blocks = num_tiles * (D / WIDTH);
+	const int feature_bytes = BATCH * (WIDTH / 4) * sizeof(float4);
+	auto kernel = render_features<D, BATCH, WIDTH>;
 	cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
-	kernel<<<blocks, threads, feature_bytes>>>(
+	kernel<<<blocks, RENDER_BATCH, feature_bytes>>>(
 		tile_ranges, values_sorted, means2D, conic, color_opacity, features, width, height, output,
 		final_transmittance, n_contrib
 	);
@@ -209,13 +204,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
 		output.data_ptr<float>(), final_transmittance.data_ptr<float>(), n_contrib.data_ptr<int>()
 	);
 
-	// The fastest launch layout measured on an L4 for each D.
+	// Slices of at most 64 channels keep a thread near 128 registers, so two blocks fit per SM on an L4.
 	switch (D) {
-		case 32: std::apply(launch_render_features<32, 1, 256, 128>, args); break;
-		case 64: std::apply(launch_render_features<64, 1, 256, 128>, args); break;
-		case 128: std::apply(launch_render_features<128, 2, 128, 64>, args); break;
-		case 256: std::apply(launch_render_features<256, 2, 128, 64>, args); break;
-		case 512: std::apply(launch_render_features<512, 4, 64, 32>, args); break;
+		case 32: std::apply(launch_render_features<32, 128, 32>, args); break;
+		case 64: std::apply(launch_render_features<64, 128, 64>, args); break;
+		case 128: std::apply(launch_render_features<128, 128, 64>, args); break;
+		case 256: std::apply(launch_render_features<256, 128, 64>, args); break;
+		case 512: std::apply(launch_render_features<512, 128, 64>, args); break;
 		default: TORCH_CHECK(false, "features must have 32, 64, 128, 256 or 512 channels, got ", D);
 	}
 	check_cuda_error("render_features");

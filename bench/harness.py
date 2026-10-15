@@ -198,10 +198,10 @@ def gsplat_pairs(inputs: dict[str, torch.Tensor], camera: Camera, packed: bool) 
 
 def agrees(theirs: dict[str, torch.Tensor], ours: dict[str, torch.Tensor], label: str) -> bool:
 	for name, want in ours.items():
-		print(f"{label} {name:24s} {stats(theirs[name], want)}")
+		print(f"{label} {name:24s} {stats(theirs[name], want.cuda())}")
 	try:
 		for name, want in ours.items():
-			assert_agree(name, theirs[name], want)
+			assert_agree(name, theirs[name], want.cuda())
 	except AssertionError as error:
 		print(f"{label} DISAGREES, not timed: {error}")
 		return False
@@ -227,7 +227,8 @@ def main() -> None:
 	rows = []
 	for channels in args.channels:
 		inputs = shared_inputs(model, camera, channels)
-		ours = render_with_grads(render_ours, inputs, camera=camera)
+		# Held on the CPU so the reference does not take memory from either timed run.
+		ours = {name: t.cpu() for name, t in render_with_grads(render_ours, inputs, camera=camera).items()}
 		rows.append({"impl": "ours", "channels": channels, "config": {}, "pairs": ours_pairs(inputs, camera),
 					 **time_render(render_ours, inputs, f"ours D={channels}", camera=camera)})
 		print(f"D={channels} ours {rows[-1]['fwd']['median_ms']:.2f} / {rows[-1]['bwd']['median_ms']:.2f} ms")

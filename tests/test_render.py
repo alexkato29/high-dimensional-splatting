@@ -152,7 +152,7 @@ def assert_matches_oracle(inputs: tuple, width: int, height: int) -> None:
 	assert_image_close(image, target_image)
 	assert_grads_close(("means2D", "conics", "colors", "opacities"), grads, target_grads)
 
-	# D = 128 runs batches of 64 and two lanes per pixel, the layout furthest from RGB.
+	# D = 128 splits the forward into two channel slices per tile, the layout furthest from RGB.
 	features = torch.rand(len(depths), 128, generator=g, device="cuda")
 	grad_features = torch.rand(height, width, 128, generator=g, device="cuda")
 

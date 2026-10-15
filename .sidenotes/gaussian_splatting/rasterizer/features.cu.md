@@ -1,10 +1,17 @@
-@@ for (int i = 0; i < VEC4_PER_LANE; i++) {
-Accumulate the overall rendered values of a given feature channel for a given pixel. 
+@@ __global__ void __launch_bounds__(RENDER_BATCH) render_features(
+For long feature vectors (e.g., 512 dimensions), it is expensive on occupancy to stage the entire vector in shared memory. For a batch of 64 Gaussians, 64 Gaussians * 512 features / gaussian * 4 bytes / features = 131kb. Each SM only has 100kb total, so you can see how this becomes a problem... `WIDTH` splits up channels over blocks. When `WIDTH = 128`, and features are 512d, 4 blocks will each work on 128d of the feature vector simultaneously. Now, in SMEM: 64 Gaussians * 128 features / gaussian * 4 bytes / feature = 33kb. Far better, we can actually fit multiple blocks at this rate.
+
+`WIDTH` also bounds register pressure, since `acc` holds `WIDTH` floats per thread in registers.
+
+@@ float4 f = row[i];
+Accumulate the overall rendered values of a given feature channel for a given pixel. This loop is pretty dead simple. Just scales each channel by the blending weight of the current gaussian in registers, reading the staged slice one `float4` at a time.
+
+Parallelism: Each thread owns the `WIDTH` channels of its block's slice for a particular pixel.
 
 @@ if (test_transmittance < MIN_TRANSMITTANCE) {
 The parallelism here is deceptive, and this line actually can do repeated work. Why? `acc` holds final render values of a particular *pixel's* feature vector. `transmittance` is also per pixel. Now, for small `D`, the entire feature vector can fit comfortably into `acc`, so each thread really is just concerned with one unique pixel.
 
-For large `D`, `acc` becomes only a subset of the whole feature vector, and multiple threads now have to team up to take on a single pixel. But, `transmittance` necessarily only has one meaningful value per output pixel. There is no work to split up. That means that in the case where `k` threads are working on one pixel, they are *all computing the same `transmittance`/`done`/other pixel level values*. 
+For large `D`, `acc` becomes only a subset of the whole feature vector, and multiple blocks (one per channel slice) now have to team up to take on a single pixel. But, `transmittance` necessarily only has one meaningful value per output pixel. There is no work to split up. That means that in the case where `k` slices are working on one pixel, they are *all computing the same `transmittance`/`done`/other pixel level values*. 
 
 This is repeated work, though it has essentially 0 cost and unlocks the savings of dividing up channels.
 
@@ -16,23 +23,20 @@ We just cooperatively loaded a batch of gaussians, and this loop traverses them.
 
 Parallelism: Each lane within a warp will verify if a particular gaussian influences any of the `rect` pixels belonging to the warp. 
 
-@@ if (__syncthreads_count(done) == THREADS) break;
+@@ if (__syncthreads_count(done) == RENDER_BATCH) break;
 This line has two roles:
 - Early exit the loop when every pixel in the tile has reached its maximum transmittance.
 - Stall until all threads have finished the previous gaussian batch. Without the stall, a new batch may overwrite the previous before rendering is completed.
 
 Parallelism: each thread is tracking the `done` status of a single pixel.
 
-@@ float acc[VEC4_PER_LANE * 4];
-This will be the kernel's output: `VEC4_PER_LANE * 4` channels of the final feature vector of a given pixel. The times 4 `acc` holds floats.
+@@ float acc[WIDTH];
+This will be the kernel's output: the `WIDTH` channels of this block's slice of the final feature vector of a given pixel.
 
 Parallelism: Each thread is working on a subset of the final channels for a particular pixel.
 
 @@ extern __shared__ float4 s_feat[];
-Static shared memory arrays are capped to 48kb on an L4, but it allows up to 99 KB per block through a dynamic allocation. At `D >= 256` the staged features already limit us to one block per SM, so shared memory beyond that won't cost occupancy. We size the batch to use as much of it as the 32-Gaussian granularity allows.
-
-@@ template <int D, int LANES_PER_PIXEL, int PIXELS_PER_BLOCK, int BATCH>
-Without `LANES_PER_PIXEL`, each thread's register requirements would be unbounded. This keeps occupancy realisitc.
+Static shared memory arrays are capped to 48kb on an L4, but it allows up to 99 KB per block through a dynamic allocation. With `WIDTH = 64` and `BATCH = 128` a block stages 32 KB, so shared memory allows two blocks per SM, the same as registers.
 
 @@ atomicAdd(&grad_features[(size_t)gaussian_id * D + channel0 + lane + 32 * i], dL_df);
 Because there are no vectorized atomics on the L4 GPU (which I wrote this on), we unfortunately must write each each gradient individually. Each lane, at this point, writes all the channels it was responsible for.
