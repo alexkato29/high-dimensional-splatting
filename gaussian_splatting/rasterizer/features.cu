@@ -27,6 +27,10 @@ __device__ inline float4 warp_rect(float2 pixel) {
 					   __shfl_sync(FULL_MASK, pixel.y, 0), __shfl_sync(FULL_MASK, pixel.y, 31));
 }
 
+__device__ inline int2 warp_pixel(int warp, int lane) {
+	return make_int2((warp & 1) * 8 + (lane & 7), (warp >> 1) * 4 + (lane >> 3));
+}
+
 template <int D, int BATCH, int WIDTH>
 __global__ void __launch_bounds__(RENDER_BATCH) render_features(
 	const uint2* tile_ranges,
@@ -54,8 +58,9 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features(
 	const int channel0 = (blockIdx.x % SLICES) * WIDTH;
 	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 
-	const int px = (tile_idx % tiles_x) * TILE_SIZE + tid % TILE_SIZE;
-	const int py = (tile_idx / tiles_x) * TILE_SIZE + tid / TILE_SIZE;
+	const int2 local = warp_pixel(tid >> 5, lane);
+	const int px = (tile_idx % tiles_x) * TILE_SIZE + local.x;
+	const int py = (tile_idx / tiles_x) * TILE_SIZE + local.y;
 	const bool inside = px < image_width && py < image_height;
 	const float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 	const float4 rect = warp_rect(pixel);
@@ -255,8 +260,9 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	const int tile_x0 = (tile_idx % tiles_x) * TILE_SIZE;
 	const int tile_y0 = (tile_idx / tiles_x) * TILE_SIZE;
 
-	const int px = tile_x0 + tid % TILE_SIZE;
-	const int py = tile_y0 + tid / TILE_SIZE;
+	const int2 local = warp_pixel(warp, lane);
+	const int px = tile_x0 + local.x;
+	const int py = tile_y0 + local.y;
 	const bool pixel_inside = px < image_width && py < image_height;
 	const float2 pixel = make_float2(px + 0.5f, py + 0.5f);
 	const int pixel_idx = py * image_width + px;
@@ -275,8 +281,9 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	float grad[CHANNELS_PER_LANE][32];
 	#pragma unroll
 	for (int p = 0; p < 32; p++) {
-		int x = tile_x0 + (warp * 32 + p) % TILE_SIZE;
-		int y = tile_y0 + (warp * 32 + p) / TILE_SIZE;
+		int2 lp = warp_pixel(warp, p);
+		int x = tile_x0 + lp.x;
+		int y = tile_y0 + lp.y;
 		bool in = x < image_width && y < image_height;
 		#pragma unroll
 		for (int i = 0; i < CHANNELS_PER_LANE; i++)

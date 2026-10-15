@@ -1,3 +1,8 @@
+@@ __device__ inline int2 warp_pixel(int warp, int lane) {
+When performing warp culling, we use this function to ensure warp boxes are `8x4`. Why? It is the rectangle of area 32 with the smallest perimeter at 24. 
+
+The worst case for a warp during is having a gaussian touch the edge. The whole warp must pursue a gaussian that only one of its pixels will touch. Minimizing the perimeter minimizes the size of the edge, so this change is mostly a theoretical "correctness". In practice, the observed speedup is small like 3-9%. But it does see 12.5% fewer passes (on the truck scene) on average... Always feels good when theory works.
+
 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features(
 For long feature vectors (e.g., 512 dimensions), it is expensive on occupancy to stage the entire vector in shared memory. For a batch of 64 Gaussians, 64 Gaussians * 512 features / gaussian * 4 bytes / features = 131kb. Each SM only has 100kb total, so you can see how this becomes a problem... `WIDTH` splits up channels over blocks. When `WIDTH = 128`, and features are 512d, 4 blocks will each work on 128d of the feature vector simultaneously. Now, in SMEM: 64 Gaussians * 128 features / gaussian * 4 bytes / feature = 33kb. Far better, we can actually fit multiple blocks at this rate.
 
