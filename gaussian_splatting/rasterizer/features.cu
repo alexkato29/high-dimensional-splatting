@@ -46,6 +46,17 @@ constexpr int FLOAT4_SIZE = 4;
 constexpr int W_STRIDE = WARP_SIZE + 8;
 constexpr int MMAS_PER_WARP = WARP_SIZE / MMA_M;
 
+// Rounds to the nearest TF32 value. To avoid bias during MMA from truncation.
+__device__ inline float to_tf32(float x) {
+	uint32_t r;
+	asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+	return __uint_as_float(r);
+}
+
+__device__ inline float4 to_tf32(float4 v) {
+	return make_float4(to_tf32(v.x), to_tf32(v.y), to_tf32(v.z), to_tf32(v.w));
+}
+
 // c += a . b on one TF32 tile, register layouts per the PTX ISA "Matrix Fragments for mma.m16n8k8".
 __device__ inline void mma_tf32(float* c, const float* a, float b0, float b1) {
 	asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -183,7 +194,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 		__syncthreads();
 		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += BLOCK_SIZE) {
 			int slot = i / VEC4_PER_SLICE;
-			s_feat[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + channel0 / FLOAT4_SIZE + i % VEC4_PER_SLICE];
+			s_feat[i] = to_tf32(features[(size_t)s_id[slot] * VEC4_PER_ROW + channel0 / FLOAT4_SIZE + i % VEC4_PER_SLICE]);
 		}
 		__syncthreads();
 
@@ -220,7 +231,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 				}
 
 				if (!__any_sync(FULL_MASK, hit)) continue;
-				w_group[count * W_STRIDE + lane] = w;
+				w_group[count * W_STRIDE + lane] = to_tf32(w);
 				slot_group[count++] = slot;
 
 				if (count == MMA_K) {

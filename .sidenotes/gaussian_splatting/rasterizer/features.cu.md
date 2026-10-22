@@ -1,3 +1,15 @@
+@@ asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+Tensor cores on the L4 operate on tf32 representations of floats. The difference: fp32 has 23 mantissa bits, tf32 has 10. To convert, the values are truncated. That meaningfully increased error of our renderings compared to the oracle. While it's intuitive why (truncation always biases to round down), the math is still interesting.
+
+I won't cover the exact math here, but this table has the gist:
+
+|                  | Mean                 | Variance | Relative error of a blend of `N_eff` gaussians |
+| ---------------- | ------------------------------------ | ----------------- | ---------------------------------------------- |
+| Truncate         | `-ulp / 2`, about `-3.5e-4` relative | `ulp^2 / 12`      | about `7e-4`, stuck there no matter `N_eff`    |
+| Round to nearest | `0`                                  | `ulp^2 / 12`      | about `2.9e-4 / sqrt(N_eff)`                   |
+
+The variance is the same, but the mean differs. Errors with no bias partially cancel as more gaussians blend into a pixel, while a bias just continues to add up. 
+
 @@ blend_group<MMAS_PER_WIDTH>(acc, w_group, slot_group, feat, lane);
 The tensor core blending operation for a group of `MMA_K` gaussians. Perhaps the most interesting fact: this operation has nothing to do with being compute bound. Before this change, the kernel was actually severely underutilizing compute...
 
