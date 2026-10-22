@@ -7,6 +7,8 @@
 
 #define TILE_SIZE 16
 #define RENDER_BATCH (TILE_SIZE * TILE_SIZE)
+#define BLOCK_SIZE (TILE_SIZE * TILE_SIZE)
+#define WARP_SIZE 32
 
 #define MIN_TRANSMITTANCE 1e-4f
 

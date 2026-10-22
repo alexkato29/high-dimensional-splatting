@@ -31,8 +31,10 @@ __device__ inline int2 warp_pixel(int warp, int lane) {
 	return make_int2((warp & 1) * 8 + (lane & 7), (warp >> 1) * 4 + (lane >> 3));
 }
 
+constexpr int FLOAT4_SIZE = 4;
+
 template <int D, int BATCH, int WIDTH>
-__global__ void __launch_bounds__(RENDER_BATCH) render_features(
+__global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 	const uint2* tile_ranges,
 	const int* values_sorted,
 	const float2* means2D,
@@ -45,20 +47,20 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features(
 	float* final_transmittance,
 	int* n_contrib
 ) {
-	constexpr int VEC4_PER_ROW = D / 4;
-	constexpr int VEC4_PER_SLICE = WIDTH / 4;
+	constexpr int VEC4_PER_ROW = D / FLOAT4_SIZE;
+	constexpr int VEC4_PER_SLICE = WIDTH / FLOAT4_SIZE;
 	constexpr int SLICES = D / WIDTH;
 	static_assert(D % WIDTH == 0 && WIDTH % 4 == 0, "slices must split the channels into whole float4s");
-	static_assert(BATCH % 32 == 0, "culling tests 32 gaussians per ballot");
+	static_assert(BATCH % WARP_SIZE == 0, "culling tests 32 gaussians per ballot");
 
 	const int tid = threadIdx.x;
-	const int lane = tid & 31;
+	const int lane = tid % WARP_SIZE;
 
 	const int tile_idx = blockIdx.x / SLICES;
 	const int channel0 = (blockIdx.x % SLICES) * WIDTH;
 	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 
-	const int2 local = warp_pixel(tid >> 5, lane);
+	const int2 local = warp_pixel(tid / WARP_SIZE, lane);
 	const int px = (tile_idx % tiles_x) * TILE_SIZE + local.x;
 	const int py = (tile_idx / tiles_x) * TILE_SIZE + local.y;
 	const bool inside = px < image_width && py < image_height;
@@ -83,10 +85,10 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features(
 	int last_contributor = 0;
 
 	for (int batch_start = 0; batch_start < num_todo; batch_start += BATCH) {
-		if (__syncthreads_count(done) == RENDER_BATCH) break;
+		if (__syncthreads_count(done) == BLOCK_SIZE) break;
 
 		int batch_count = min(BATCH, num_todo - batch_start);
-		for (int i = tid; i < batch_count; i += RENDER_BATCH) {
+		for (int i = tid; i < batch_count; i += BLOCK_SIZE) {
 			int gaussian_id = values_sorted[range.x + batch_start + i];
 			s_id[i] = gaussian_id;
 			s_mean[i] = means2D[gaussian_id];
@@ -96,13 +98,13 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features(
 			s_extent[i] = culling_extent(c, opacity);
 		}
 		__syncthreads();
-		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += RENDER_BATCH) {
+		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += BLOCK_SIZE) {
 			int slot = i / VEC4_PER_SLICE;
-			s_feat[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + channel0 / 4 + i % VEC4_PER_SLICE];
+			s_feat[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + channel0 / FLOAT4_SIZE + i % VEC4_PER_SLICE];
 		}
 		__syncthreads();
 
-		for (int group_start = 0; group_start < batch_count; group_start += 32) {
+		for (int group_start = 0; group_start < batch_count; group_start += WARP_SIZE) {
 			if (__all_sync(FULL_MASK, done)) break;
 			int candidate = group_start + lane;
 			unsigned mask = __ballot_sync(FULL_MASK, candidate < batch_count && box_hits(s_mean[candidate], s_extent[candidate], rect));
@@ -164,10 +166,10 @@ static void launch_render_features(int num_tiles, const uint2* tile_ranges, cons
 								   const float4* features, int width, int height, float* output,
 								   float* final_transmittance, int* n_contrib) {
 	const int blocks = num_tiles * (D / WIDTH);
-	const int feature_bytes = BATCH * (WIDTH / 4) * sizeof(float4);
+	const int feature_bytes = BATCH * (WIDTH / FLOAT4_SIZE) * sizeof(float4);
 	auto kernel = render_features<D, BATCH, WIDTH>;
 	cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
-	kernel<<<blocks, RENDER_BATCH, feature_bytes>>>(
+	kernel<<<blocks, BLOCK_SIZE, feature_bytes>>>(
 		tile_ranges, values_sorted, means2D, conic, color_opacity, features, width, height, output,
 		final_transmittance, n_contrib
 	);
@@ -225,7 +227,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_features(
 // Each block owns one tile and WIDTH of its D channels. The geometry gradients are linear in the
 // features, so the slices of a tile add theirs up through the atomics in any order.
 template <int D, int WIDTH, int BATCH>
-__global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
+__global__ void __launch_bounds__(BLOCK_SIZE) render_features_backward(
 	const uint2* tile_ranges,
 	const int* values_sorted,
 	const float2* means2D,
@@ -243,16 +245,16 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	float* grad_opacities
 ) {
 	constexpr int SLICES = D / WIDTH;
-	constexpr int VEC4_PER_ROW = D / 4;
-	constexpr int VEC4_PER_SLICE = WIDTH / 4;
-	constexpr int CHANNELS_PER_LANE = WIDTH / 32;
+	constexpr int VEC4_PER_ROW = D / FLOAT4_SIZE;
+	constexpr int VEC4_PER_SLICE = WIDTH / FLOAT4_SIZE;
+	constexpr int CHANNELS_PER_LANE = WIDTH / WARP_SIZE;
 	static_assert(D % WIDTH == 0, "slices must split the channels evenly");
-	static_assert(WIDTH % 32 == 0, "each lane must own the same number of channels");
-	static_assert(BATCH % 32 == 0, "culling tests 32 gaussians per ballot");
+	static_assert(WIDTH % WARP_SIZE == 0, "each lane must own the same number of channels");
+	static_assert(BATCH % WARP_SIZE == 0, "culling tests 32 gaussians per ballot");
 
 	const int tid = threadIdx.x;
-	const int lane = tid & 31;
-	const int warp = tid >> 5;
+	const int lane = tid % WARP_SIZE;
+	const int warp = tid / WARP_SIZE;
 
 	const int tile_idx = blockIdx.x / SLICES;
 	const int channel0 = (blockIdx.x % SLICES) * WIDTH;
@@ -274,20 +276,20 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
 	extern __shared__ float4 s_feat4[];
-	__shared__ float s_weight[RENDER_BATCH];
+	__shared__ float s_weight[BLOCK_SIZE];
 	__shared__ int s_last_contributor;
 	const float* s_feat = reinterpret_cast<const float*>(s_feat4);
 
-	float grad[CHANNELS_PER_LANE][32];
+	float grad[CHANNELS_PER_LANE][WARP_SIZE];
 	#pragma unroll
-	for (int p = 0; p < 32; p++) {
+	for (int p = 0; p < WARP_SIZE; p++) {
 		int2 lp = warp_pixel(warp, p);
 		int x = tile_x0 + lp.x;
 		int y = tile_y0 + lp.y;
 		bool in = x < image_width && y < image_height;
 		#pragma unroll
 		for (int i = 0; i < CHANNELS_PER_LANE; i++)
-			grad[i][p] = in ? grad_output[D * (y * image_width + x) + channel0 + lane + 32 * i] : 0.0f;
+			grad[i][p] = in ? grad_output[D * (y * image_width + x) + channel0 + lane + WARP_SIZE * i] : 0.0f;
 	}
 	float transmittance = pixel_inside ? final_transmittance[pixel_idx] : 0.0f;
 	int last_contributor = pixel_inside ? n_contrib[pixel_idx] : 0;
@@ -306,7 +308,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 		int batch_start = batch_end - batch_count;
 
 		__syncthreads();
-		for (int i = tid; i < batch_count; i += RENDER_BATCH) {
+		for (int i = tid; i < batch_count; i += BLOCK_SIZE) {
 			int gaussian_id = values_sorted[range.x + batch_start + i];
 			s_id[i] = gaussian_id;
 			s_mean[i] = means2D[gaussian_id];
@@ -317,13 +319,13 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 		}
 
 		__syncthreads();
-		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += RENDER_BATCH) {
+		for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += BLOCK_SIZE) {
 			int slot = i / VEC4_PER_SLICE;
-			s_feat4[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + (channel0 / 4) + (i - slot * VEC4_PER_SLICE)];
+			s_feat4[i] = features[(size_t)s_id[slot] * VEC4_PER_ROW + (channel0 / FLOAT4_SIZE) + (i - slot * VEC4_PER_SLICE)];
 		}
 		__syncthreads();
 
-		for (int group_start = (batch_count - 1) / 32 * 32; group_start >= 0; group_start -= 32) {
+		for (int group_start = (batch_count - 1) / WARP_SIZE * WARP_SIZE; group_start >= 0; group_start -= WARP_SIZE) {
 			int candidate = group_start + lane;
 			unsigned mask = __ballot_sync(FULL_MASK, candidate < batch_count && box_hits(s_mean[candidate], s_extent[candidate], rect));
 			while (mask) {
@@ -350,15 +352,15 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 
 				float f[CHANNELS_PER_LANE];
 				#pragma unroll
-				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[slot * WIDTH + lane + 32 * i];
-				float partial[32];
+				for (int i = 0; i < CHANNELS_PER_LANE; i++) f[i] = s_feat[slot * WIDTH + lane + WARP_SIZE * i];
+				float partial[WARP_SIZE];
 				#pragma unroll
-				for (int px = 0; px < 32; px++) {
+				for (int px = 0; px < WARP_SIZE; px++) {
 					partial[px] = 0.0f;
 					#pragma unroll
 					for (int i = 0; i < CHANNELS_PER_LANE; i++) partial[px] += f[i] * grad[i][px];
 				}
-				float dot = reduce_scatter<32, 32>(partial, lane);
+				float dot = reduce_scatter<WARP_SIZE, WARP_SIZE>(partial, lane);
 
 				float dL_dalpha = 0.0f;
 				float weight = 0.0f;
@@ -387,7 +389,7 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 					v[5] = dL_dG * gauss * -0.5f * dy * dy;
 				}
 
-				float total = reduce_scatter<8, 32>(v, lane);
+				float total = reduce_scatter<8, WARP_SIZE>(v, lane);
 				int k = lane >> 2;
 
 				int gaussian_id = s_id[slot];
@@ -401,17 +403,17 @@ __global__ void __launch_bounds__(RENDER_BATCH) render_features_backward(
 
 				s_weight[tid] = weight;
 				__syncwarp();
-				float w[32];
+				float w[WARP_SIZE];
 				#pragma unroll
-				for (int p = 0; p < 32; p++) w[p] = s_weight[warp * 32 + p];
+				for (int p = 0; p < WARP_SIZE; p++) w[p] = s_weight[warp * WARP_SIZE + p];
 				__syncwarp();
 
 				#pragma unroll
 				for (int i = 0; i < CHANNELS_PER_LANE; i++) {
 					float dL_df = 0.0f;
 					#pragma unroll
-					for (int p = 0; p < 32; p++) dL_df += w[p] * grad[i][p];
-					atomicAdd(&grad_features[(size_t)gaussian_id * D + channel0 + lane + 32 * i], dL_df);
+					for (int p = 0; p < WARP_SIZE; p++) dL_df += w[p] * grad[i][p];
+					atomicAdd(&grad_features[(size_t)gaussian_id * D + channel0 + lane + WARP_SIZE * i], dL_df);
 				}
 			}
 		}
@@ -426,10 +428,10 @@ static void launch_render_features_backward(int num_tiles, const uint2* tile_ran
 											const float* grad_output, int width, int height,
 											float* grad_means2D, float* grad_conics, float* grad_features,
 											float* grad_opacities) {
-	const int feature_bytes = BATCH * (WIDTH / 4) * sizeof(float4);
+	const int feature_bytes = BATCH * (WIDTH / FLOAT4_SIZE) * sizeof(float4);
 	auto kernel = render_features_backward<D, WIDTH, BATCH>;
 	cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, feature_bytes);
-	kernel<<<num_tiles * (D / WIDTH), RENDER_BATCH, feature_bytes>>>(
+	kernel<<<num_tiles * (D / WIDTH), BLOCK_SIZE, feature_bytes>>>(
 		tile_ranges, values_sorted, means2D, conic, color_opacity, features, final_transmittance, n_contrib,
 		grad_output, width, height, grad_means2D, grad_conics, grad_features, grad_opacities
 	);
