@@ -16,7 +16,7 @@ from gaussian_splatting.utils.dataset import Camera, ColmapDataset
 from gaussian_splatting.utils.gaussian import GaussianModel
 from tests.test_golden import environment
 from tests.test_properties import FLIP_MAX_ERROR
-from tests.test_render import assert_grads_close, assert_image_close
+from tests.test_render import FEATURE_PERC_99, assert_grads_close, assert_image_close
 
 OUTPUTS = ("image", "feature_image")
 LEAVES = ("means", "scales", "quats", "opacities", "colors", "features")
@@ -108,7 +108,9 @@ def stats(got: torch.Tensor, want: torch.Tensor) -> str:
 
 
 def assert_agree(name: str, got: torch.Tensor, want: torch.Tensor) -> None:
-	if name.endswith(OUTPUTS):
+	if name == "feature_image":
+		assert_image_close(got, want, max_error=FLIP_MAX_ERROR, max_perc_99=FEATURE_PERC_99)
+	elif name.endswith(OUTPUTS):
 		assert_image_close(got, want, max_error=FLIP_MAX_ERROR)
 	else:
 		assert_grads_close((name,), [got], [want])

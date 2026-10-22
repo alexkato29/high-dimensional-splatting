@@ -25,11 +25,21 @@ def render_and_grads(rasterizer, inputs: tuple, width: int, height: int, backgro
 	return image.detach(), [t.grad for t in leaves]
 
 
-def assert_image_close(got: torch.Tensor, want: torch.Tensor, max_error: float = 2e-3) -> None:
+# The feature forward blends on TF32 tensor cores, which round each weight and feature to 10 mantissa bits.
+FEATURE_MAX_ERROR = 1e-3
+FEATURE_PERC_99 = 5e-4
+
+
+def assert_image_close(got: torch.Tensor, want: torch.Tensor, max_error: float = 2e-3,
+					   max_perc_99: float = 1e-4) -> None:
 	diff = (got - want).abs()
 	# kthvalue because quantile refuses more than 16M elements and a D = 32 feature image of Truck is 17M.
 	perc_99 = diff.flatten().kthvalue(max(1, math.ceil(0.99 * diff.numel()))).values
-	assert diff.max() < max_error and perc_99 < 1e-4, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
+	assert diff.max() < max_error and perc_99 < max_perc_99, f"max {diff.max().item():.2e}, 99th {perc_99.item():.2e}"
+
+
+def assert_features_close(got: torch.Tensor, want: torch.Tensor, renders: float = 1) -> None:
+	assert_image_close(got, want, max_error=renders * FEATURE_MAX_ERROR, max_perc_99=renders * FEATURE_PERC_99)
 
 
 def assert_grads_close(names: tuple[str, ...], grads: Sequence[torch.Tensor | None],
@@ -59,7 +69,8 @@ def test_features_forward_matches_oracle(channels):
 	image, feature_image = rasterize(*inputs, width, height, features=features)
 	assert torch.equal(image, rasterize(*inputs, width, height))
 	means2D, depths, radii, conics, _, opacities = inputs
-	assert_image_close(feature_image, rasterize_reference(means2D, depths, radii, conics, features, opacities, width, height))
+	want = rasterize_reference(means2D, depths, radii, conics, features, opacities, width, height)
+	assert_features_close(feature_image, want)
 
 
 def test_unsupported_feature_width_is_rejected():
@@ -165,7 +176,7 @@ def assert_matches_oracle(inputs: tuple, width: int, height: int) -> None:
 	got_image, got = feature_render(
 		lambda m, c, f, o: rasterize(m, depths, radii, c, colors, o, width, height, features=f)[1])
 	want_image, want = feature_render(lambda m, c, f, o: rasterize_reference(m, depths, radii, c, f, o, width, height))
-	assert_image_close(got_image, want_image)
+	assert_features_close(got_image, want_image)
 	assert_grads_close(("means2D", "conics", "features", "opacities"), got, want)
 
 

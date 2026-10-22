@@ -6,7 +6,13 @@ from hypothesis import given
 from gaussian_splatting.rasterizer import rasterize
 from gaussian_splatting.rasterizer.projection import quat_to_rotmat
 from tests.scenes import gaussians, project, scene, scene_sizes, with_size_examples
-from tests.test_render import assert_grads_close, assert_image_close
+from tests.test_render import (
+	FEATURE_MAX_ERROR,
+	FEATURE_PERC_99,
+	assert_features_close,
+	assert_grads_close,
+	assert_image_close,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the rasterizer needs CUDA")
 
@@ -102,7 +108,7 @@ def test_invisible_gaussians_change_nothing(channels, sizes):
 											 features=all_features)
 
 	assert torch.equal(image, image_all)
-	assert torch.equal(feature_image, feature_image_all)
+	assert_features_close(feature_image_all, feature_image, renders=2)
 
 
 @pytest.mark.parametrize("channels", CHANNELS)
@@ -117,12 +123,13 @@ def test_blend_weights_are_convex(channels, sizes):
 	# Ones over a black background blend to 1 - T, the share of light the gaussians took.
 	rgb_coverage, coverage = rasterize(*geometry, width, height, features=torch.ones(n, channels, device="cuda"))
 	assert torch.equal(coverage, coverage[..., :1].expand_as(coverage))
-	assert (coverage >= 0).all() and (coverage <= 1 + 1e-6).all()
+	# Rounded TF32 weights can each land half a step high, so a fully covered pixel may read just over 1.
+	assert (coverage >= 0).all() and (coverage <= 1 + FEATURE_MAX_ERROR).all()
 	# Both passes compute alpha and T on their own so they must agree on the coverage.
-	assert_image_close(rgb_coverage, coverage[..., :3])
+	assert_features_close(coverage[..., :3], rgb_coverage)
 
 	constant = rasterize(*geometry, width, height, features=torch.full((n, channels), 0.3, device="cuda"))[1]
-	torch.testing.assert_close(constant, 0.3 * coverage, rtol=1e-5, atol=1e-6)
+	assert_features_close(constant, 0.3 * coverage, renders=2)
 
 	low, high = 0.25, 0.75
 	g = torch.Generator(device="cuda").manual_seed(seed)
@@ -175,7 +182,7 @@ def test_features_blend_linearly(channels, sizes):
 	mixed = rasterize(*inputs, width, height, features=a * first + b * second)[1]
 	want = (a * rasterize(*inputs, width, height, features=first)[1]
 			+ b * rasterize(*inputs, width, height, features=second)[1])
-	torch.testing.assert_close(mixed, want, rtol=1e-5, atol=1e-5)
+	assert_features_close(mixed, want, renders=1 + abs(a) + abs(b))
 
 
 @pytest.mark.parametrize("half", [32, 64])
@@ -282,7 +289,8 @@ def test_mirrored_scene_renders_mirrored_image(channels, sizes):
 
 	# Same math in a different float order, so only close.
 	assert_image_close(mirrored_image, image.flip(1), max_error=FLIP_MAX_ERROR)
-	assert_image_close(mirrored_feature_image, feature_image.flip(1), max_error=FLIP_MAX_ERROR)
+	assert_image_close(mirrored_feature_image, feature_image.flip(1), max_error=FLIP_MAX_ERROR,
+					   max_perc_99=2 * FEATURE_PERC_99)
 
 
 @pytest.mark.parametrize("channels", CHANNELS)
@@ -303,7 +311,7 @@ def test_moving_scene_and_camera_together_changes_nothing(channels, sizes):
 		*project(moved, width, height, world_to_camera), width, height, features=features)
 
 	assert_image_close(moved_image, image, max_error=FLIP_MAX_ERROR)
-	assert_image_close(moved_feature_image, feature_image, max_error=FLIP_MAX_ERROR)
+	assert_image_close(moved_feature_image, feature_image, max_error=FLIP_MAX_ERROR, max_perc_99=2 * FEATURE_PERC_99)
 
 
 def test_quat_multiply_composes_rotations():
