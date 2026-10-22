@@ -21,7 +21,7 @@ __device__ inline bool box_hits(float2 mean, float2 extent, float4 rect) {
 		&& mean.y + extent.y >= rect.z && mean.y - extent.y <= rect.w;
 }
 
-// Every lane agrees that the top left pixel is l0, and bottom right is l31.
+// Every lane agrees that the top left pixel is lane 0, and bottom right is lane 31.
 __device__ inline float4 warp_rect(float2 pixel) {
 	return make_float4(__shfl_sync(FULL_MASK, pixel.x, 0), __shfl_sync(FULL_MASK, pixel.x, 31),
 					   __shfl_sync(FULL_MASK, pixel.y, 0), __shfl_sync(FULL_MASK, pixel.y, 31));
@@ -31,7 +31,76 @@ __device__ inline int2 warp_pixel(int warp, int lane) {
 	return make_int2((warp & 1) * 8 + (lane & 7), (warp >> 1) * 4 + (lane >> 3));
 }
 
+// Hardcoded for a NVIDIA L4 GPU.
+constexpr int MMA_M = 16;
+constexpr int MMA_N = 8;
+constexpr int MMA_K = 8;
+
+constexpr int A_VALS_PER_LANE = MMA_M * MMA_K / WARP_SIZE;
+constexpr int C_VALS_PER_LANE = MMA_M * MMA_N / WARP_SIZE;
+constexpr int C_COLS_PER_LANE = 2;
+
+constexpr int LANES_PER_GROUP = 32 / MMA_K;
 constexpr int FLOAT4_SIZE = 4;
+
+constexpr int W_STRIDE = WARP_SIZE + 8;
+constexpr int MMAS_PER_WARP = WARP_SIZE / MMA_M;
+
+// c += a . b on one TF32 tile, register layouts per the PTX ISA "Matrix Fragments for mma.m16n8k8".
+__device__ inline void mma_tf32(float* c, const float* a, float b0, float b1) {
+	asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+		: "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+		: "r"(__float_as_uint(a[0])), "r"(__float_as_uint(a[1])), "r"(__float_as_uint(a[2])), "r"(__float_as_uint(a[3])),
+		  "r"(__float_as_uint(b0)), "r"(__float_as_uint(b1)));
+}
+
+// Compute the pixels a given lane works on, with indicator variables `m` and `half`.
+__device__ inline int fragment_pixel(int m, int half, int lane) {
+	return m * MMA_M + half * (MMA_M / 2) + lane / LANES_PER_GROUP;
+}
+
+// Channel of column n in the j-th mma across.
+template <int MMAS_PER_WIDTH>
+__device__ inline int column_channel(int n, int j) {
+	return n * MMAS_PER_WIDTH + j;
+}
+
+// Blends the warp's group of MMA_K gaussians into acc, acc += weights . features.
+template <int MMAS_PER_WIDTH>
+__device__ inline void blend_group(float (&acc)[MMAS_PER_WARP][MMAS_PER_WIDTH][C_VALS_PER_LANE],
+								   const float* w, const int* slots, const float* feat, int lane) {
+	constexpr int WIDTH = MMAS_PER_WIDTH * MMA_N;
+	__syncwarp();
+	const int group_id = lane / LANES_PER_GROUP;
+	const int lane_in_group = lane % LANES_PER_GROUP;
+	const int channel = column_channel<MMAS_PER_WIDTH>(group_id, 0);
+
+	float b0[MMAS_PER_WIDTH], b1[MMAS_PER_WIDTH];
+
+	const float* row0 = feat + slots[lane_in_group] * WIDTH + channel;
+	const float* row1 = feat + slots[lane_in_group + MMA_K / 2] * WIDTH + channel;
+
+	#pragma unroll
+	for (int q = 0; q < MMAS_PER_WIDTH / FLOAT4_SIZE; q++) {
+		float4 v0 = reinterpret_cast<const float4*>(row0)[q];
+		float4 v1 = reinterpret_cast<const float4*>(row1)[q];
+		const int k = FLOAT4_SIZE * q;
+		b0[k] = v0.x; b0[k + 1] = v0.y; b0[k + 2] = v0.z; b0[k + 3] = v0.w;
+		b1[k] = v1.x; b1[k + 1] = v1.y; b1[k + 2] = v1.z; b1[k + 3] = v1.w;
+	}
+
+	const float* w0 = w + lane_in_group * W_STRIDE;
+	const float* w1 = w + (lane_in_group + MMA_K / 2) * W_STRIDE;
+	#pragma unroll
+	for (int m = 0; m < MMAS_PER_WARP; m++) {
+		const int p0 = fragment_pixel(m, 0, lane);
+		const int p1 = fragment_pixel(m, 1, lane);
+		float a[A_VALS_PER_LANE] = {w0[p0], w0[p1], w1[p0], w1[p1]};
+		#pragma unroll
+		for (int j = 0; j < MMAS_PER_WIDTH; j++) mma_tf32(acc[m][j], a, b0[j], b1[j]);
+	}
+	__syncwarp();
+}
 
 template <int D, int BATCH, int WIDTH>
 __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
@@ -50,17 +119,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 	constexpr int VEC4_PER_ROW = D / FLOAT4_SIZE;
 	constexpr int VEC4_PER_SLICE = WIDTH / FLOAT4_SIZE;
 	constexpr int SLICES = D / WIDTH;
-	static_assert(D % WIDTH == 0 && WIDTH % 4 == 0, "slices must split the channels into whole float4s");
+	constexpr int MMAS_PER_WIDTH = WIDTH / MMA_N;
+	static_assert(D % WIDTH == 0, "slices must split the channels evenly");
+	static_assert(MMAS_PER_WIDTH % FLOAT4_SIZE == 0, "each lane must load its B channels as whole float4s");
 	static_assert(BATCH % WARP_SIZE == 0, "culling tests 32 gaussians per ballot");
 
 	const int tid = threadIdx.x;
 	const int lane = tid % WARP_SIZE;
+	const int warp = tid / WARP_SIZE;
 
 	const int tile_idx = blockIdx.x / SLICES;
 	const int channel0 = (blockIdx.x % SLICES) * WIDTH;
 	const int tiles_x = (image_width + TILE_SIZE - 1) / TILE_SIZE;
 
-	const int2 local = warp_pixel(tid / WARP_SIZE, lane);
+	const int2 local = warp_pixel(warp, lane);
 	const int px = (tile_idx % tiles_x) * TILE_SIZE + local.x;
 	const int py = (tile_idx / tiles_x) * TILE_SIZE + local.y;
 	const bool inside = px < image_width && py < image_height;
@@ -72,17 +144,28 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 	__shared__ float4 s_conic[BATCH];
 	__shared__ float2 s_extent[BATCH];
 	extern __shared__ float4 s_feat[];
+	__shared__ float s_w[BLOCK_SIZE / WARP_SIZE][MMA_K * W_STRIDE];
+	__shared__ int s_slots[BLOCK_SIZE / WARP_SIZE][MMA_K];
+	const float* feat = reinterpret_cast<const float*>(s_feat);
+
+	float* w_group = s_w[warp];
+	int* slot_group = s_slots[warp];
 
 	uint2 range = tile_ranges[tile_idx];
 	int num_todo = (int)range.y - (int)range.x;
 
-	float acc[WIDTH];
+	float acc[MMAS_PER_WARP][MMAS_PER_WIDTH][C_VALS_PER_LANE];
 	#pragma unroll
-	for (int i = 0; i < WIDTH; i++) acc[i] = 0.0f;
+	for (int m = 0; m < MMAS_PER_WARP; m++)
+		#pragma unroll
+		for (int j = 0; j < MMAS_PER_WIDTH; j++)
+			#pragma unroll
+			for (int i = 0; i < C_VALS_PER_LANE; i++) acc[m][j][i] = 0.0f;
 
 	float transmittance = 1.0f;
 	bool done = !inside;
 	int last_contributor = 0;
+	int count = 0;
 
 	for (int batch_start = 0; batch_start < num_todo; batch_start += BATCH) {
 		if (__syncthreads_count(done) == BLOCK_SIZE) break;
@@ -112,51 +195,78 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 				int slot = group_start + __ffs(mask) - 1;
 				mask &= mask - 1;
 
-				if (done) continue;
+				bool hit = false;
+				float w = 0.0f;
 
-				float2 mean = s_mean[slot];
-				float4 c = s_conic[slot];
-				float dx = pixel.x - mean.x;
-				float dy = pixel.y - mean.y;
+				if (!done) {
+					float2 mean = s_mean[slot];
+					float4 c = s_conic[slot];
+					float dx = pixel.x - mean.x;
+					float dy = pixel.y - mean.y;
+					float mahalanobis = dx * (c.x * dx + c.y * dy) + dy * (c.y * dx + c.z * dy);
+					float alpha = fminf(MAX_ALPHA, c.w * __expf(-0.5f * mahalanobis));
 
-				float mahalanobis = dx * (c.x * dx + c.y * dy) + dy * (c.y * dx + c.z * dy);
-				float alpha = fminf(MAX_ALPHA, c.w * __expf(-0.5f * mahalanobis));
-				if (alpha < MIN_ALPHA) continue;
-
-				float test_transmittance = transmittance * (1.0f - alpha);
-				if (test_transmittance < MIN_TRANSMITTANCE) {
-					done = true;
-					continue;
+					if (!(alpha < MIN_ALPHA)) {
+						float test_transmittance = transmittance * (1.0f - alpha);
+						if (test_transmittance < MIN_TRANSMITTANCE) {
+							done = true;
+						} else {
+							hit = true;
+							w = alpha * transmittance;
+							transmittance = test_transmittance;
+							last_contributor = batch_start + slot + 1;
+						}
+					}
 				}
 
-				float w = alpha * transmittance;
-				const float4* row = &s_feat[slot * VEC4_PER_SLICE];
-				#pragma unroll
-				for (int i = 0; i < VEC4_PER_SLICE; i++) {
-					float4 f = row[i];
-					acc[4 * i + 0] += w * f.x;
-					acc[4 * i + 1] += w * f.y;
-					acc[4 * i + 2] += w * f.z;
-					acc[4 * i + 3] += w * f.w;
+				if (!__any_sync(FULL_MASK, hit)) continue;
+				w_group[count * W_STRIDE + lane] = w;
+				slot_group[count++] = slot;
+
+				if (count == MMA_K) {
+					blend_group<MMAS_PER_WIDTH>(acc, w_group, slot_group, feat, lane);
+					count = 0;
 				}
-				transmittance = test_transmittance;
-				last_contributor = batch_start + slot + 1;
+			}
+		}
+
+		if (count == 0) continue;
+		for (int i = count; i < MMA_K; i++) {
+			w_group[i * W_STRIDE + lane] = 0.0f;
+			slot_group[i] = 0;
+		}
+		count = 0;
+		blend_group<MMAS_PER_WIDTH>(acc, w_group, slot_group, feat, lane);
+	}
+
+	const int lane_in_group = lane % LANES_PER_GROUP;
+	const int tile_x0 = (tile_idx % tiles_x) * TILE_SIZE;
+	const int tile_y0 = (tile_idx / tiles_x) * TILE_SIZE;
+
+	#pragma unroll
+	for (int m = 0; m < MMAS_PER_WARP; m++) {
+		#pragma unroll
+		for (int i = 0; i < C_VALS_PER_LANE; i++) {
+			int2 p = warp_pixel(warp, fragment_pixel(m, i / C_COLS_PER_LANE, lane));
+			int x = tile_x0 + p.x;
+			int y = tile_y0 + p.y;
+			if (x >= image_width || y >= image_height) continue;
+
+			int column = C_COLS_PER_LANE * lane_in_group + i % C_COLS_PER_LANE;
+			int channel = channel0 + column_channel<MMAS_PER_WIDTH>(column, 0);
+			float4* dst = reinterpret_cast<float4*>(&output[(y * image_width + x) * D + channel]);
+			#pragma unroll
+			for (int q = 0; q < MMAS_PER_WIDTH / FLOAT4_SIZE; q++) {
+				const int j = FLOAT4_SIZE * q;
+				dst[q] = make_float4(acc[m][j][i], acc[m][j + 1][i], acc[m][j + 2][i], acc[m][j + 3][i]);
 			}
 		}
 	}
 
-	if (inside) {
+	if (inside && blockIdx.x % SLICES == 0) {
 		int pixel_idx = py * image_width + px;
-		#pragma unroll
-		for (int i = 0; i < VEC4_PER_SLICE; i++) {
-			int channel = channel0 + i * 4;
-			float4* dst = reinterpret_cast<float4*>(&output[pixel_idx * D + channel]);
-			*dst = make_float4(acc[4 * i], acc[4 * i + 1], acc[4 * i + 2], acc[4 * i + 3]);
-		}
-		if (blockIdx.x % SLICES == 0) {
-			final_transmittance[pixel_idx] = transmittance;
-			n_contrib[pixel_idx] = last_contributor;
-		}
+		final_transmittance[pixel_idx] = transmittance;
+		n_contrib[pixel_idx] = last_contributor;
 	}
 }
 

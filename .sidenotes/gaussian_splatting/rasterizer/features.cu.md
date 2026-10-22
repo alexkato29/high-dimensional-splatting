@@ -1,7 +1,118 @@
+@@ blend_group<MMAS_PER_WIDTH>(acc, w_group, slot_group, feat, lane);
+The tensor core blending operation for a group of `MMA_K` gaussians. Perhaps the most interesting fact: this operation has nothing to do with being compute bound. Before this change, the kernel was actually severely underutilizing compute...
+
+The tensor core swap, rather, was motivated by avoiding a different issue: warp divergence. Before, each lane would compute an updated per pixel-gaussian `transmittance`. If the `transmittance < MIN_TRANSMITTANCE` for a given lane, it sat around idle while the others ran on to do their blending.
+
+With tensor cores, all lanes stay involved during all blends (since MMAs are warp level ops). This removed a large cause of warp divergence, and I think it's pretty interesting that this change wasn't actually motivated by the typical "we need faster math" argument.
+
+@@ asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+Absolute unit of an instruction... First, why are we writing inline assembly? Well, the CUDA tensor core API `WMMA` isn't really flexible enough to do what we are trying to do here. It loads each matrix with one fixed stride, and its register layouts are hidden. Our `B` rows are whichever gaussians happened to be heavy, scattered around `s_feat`, and the whole column mapping trick depends on knowing exactly which lane holds what. PTX gives us both.
+
+What is this instruction actually say? Reading the name left to right:
+
+- `mma.sync.aligned`: a matrix multiply-accumulate that the whole warp executes together, so all 32 lanes must reach it at once (hence all the care to avoid divergence before it).
+- `m16n8k8`: the shape. `A` is 16 x 8, `B` is 8 x 8, and the output is 16 x 8.
+- `row.col`: `A` is read row-major, `B` column-major. For TF32 at this shape it's the only option PTX offers.
+- `f32.tf32.tf32.f32`: the types of the output, `A`, `B`, and the input accumulator, in that order. Products in TF32, sums in full FP32.
+
+Then the operands, each a brace list of this lane's registers:
+
+- `{%0,%1,%2,%3}` first: the output `D`, this lane's 4 values (`C_VALS_PER_LANE`).
+- `{%4,%5,%6,%7}`: this lane's 4 values of `A`.
+- `{%8,%9}`: this lane's 2 values of `B`.
+- `{%0,%1,%2,%3}` again: the accumulator `C`. Same registers as `D`, so the result adds onto `c` in place, `c = a . b + c`.
+
+The lines below bind those `%` numbers to our variables. `"+f"` means a float register that is both read and written, which is exactly what an accumulator is. `"r"` means a plain 32-bit register, and `__float_as_uint` hands over the float's raw bits without converting anything. Why bits? PTX takes TF32 operands as 32-bit patterns and the tensor core only reads the top 19 of them (sign, exponent, 10 mantissa bits). The low 13 bits are simply ignored, which is the truncation behind any observed error. `volatile` just tells the compiler not to drop or merge the instruction.
+
+@@ float b0[MMAS_PER_WIDTH], b1[MMAS_PER_WIDTH];
+This matmul will perform `A @ B = C`. Each lane loads 2 values of `B` per matmul (since `B` holds 64 values and there are 32 lanes). `b0` and `b1` will ultimately store those 2 values, for each of the `MMAS_PER_WIDTH` matmuls.
+
+@@ for (int j = 0; j < MMAS_PER_WIDTH; j++) mma_tf32(acc[m][j], a, b0[j], b1[j]);
+Tensor cores require all hands on deck to cooperatively load values. `A` is a `16 x 8 = 128` value matrix, so each lane passes in 4 values. `B` is an `8 x 8 = 64` matrix, each lane will pass in two values.
+
+@@ if (inside && blockIdx.x % SLICES == 0) {
+This is at a per-pixel level, and we wouldn't want multiple blocks to potentially overwrite this! Recall that two blocks may work on the same pixel, though a different subset of its feature channels.
+
+@@ int channel = channel0 + column_channel<MMAS_PER_WIDTH>(column, 0);
+Map that column to a channel, but remember that the block starts at `channel0`.
+
+@@ return n * MMAS_PER_WIDTH + j;
+Unfortunately, this line has deceptively large implications... The idea of this function is to map column n in the j-th mma across to one channel. You would think it'd would be as simple as: `j * MMAS_PER_WIDTH + n`, which would map column `i` to channel `i`. But, notice that the actual function swaps `j` and `n`... The channels are actually ordered like:
+
+|           | col 0 | col 1 | … | col 7 |
+| --------- | ----- | ----- | - | ----- |
+| mma j = 0 | ch 0  | ch 8  | … | ch 56 |
+| mma j = 1 | ch 1  | ch 9  | … | ch 57 |
+| …         |       |       |   |       |
+| mma j = 7 | ch 7  | ch 15 | … | ch 63 |
+
+Columns are strided in how they represent channels. We are allowed to do this: all the `mma` instruction cares about is that dimensions line up. But *why* do we do this, given it's much harder to think about? Rather than explain it here, I motivate why this layout makes sense on each of its caller lines.
+
+@@ int column = C_COLS_PER_LANE * lane_in_group + i % C_COLS_PER_LANE;
+Computes the column a lane is actively working on within one row of an `mma` output.
+
+@@ return m * MMA_M + half * (MMA_M / 2) + lane / LANES_PER_GROUP;
+ An `mma` tile is 16 rows (pixels) by 8 columns (channels). NVIDIA specifies this layout, and it looks like:
+```
+          col 0  1  | 2  3  | 4  5  | 6  7
+row 0  (g=0)  L0 L0 | L1 L1 | L2 L2 | L3 L3
+row 1  (g=1)  L4 L4 | ...
+...
+row 8  (g=0)  L0 L0 | L1 L1 | L2 L2 | L3 L3
+row 9  (g=1)  L4 L4 | ...
+```
+Each lane gets 2 adjacent columns on 2 rows, 8 rows apart. But, for a given lane, which rows will it touch? Breaking down the formula:
+
+- `m * MMA_M`: a warp's 32 pixels take two tiles stacked, so `m (0 or 1)` indicates if we are starting at pixel 0 or 16.
+- `half * (MMA_M / 2)`: each lane appears on two rows, so `half (0 or 1)` indicates if we are in the top or bottom 8 rows of the `mma` tile.
+- `lane / LANES_PER_GROUP`: lanes come in groups of 4 that share a row, so this is the row within those 8.
+
+E.g., `fragment_pixel(m=1, half=1, lane=7)` would return 16 + 8 + 1 = 25.
+
+@@ for (int i = count; i < MMA_K; i++) {
+Sometimes, the batch may finish before the weight and slot buffers are full (`count < MMA_K`). In this case, we flush the old values and perform a blend with the present buffer. When we start a new batch, we overwrite `s_feat`, meaning we must blend now.
+
+@@ if (!done) {
+Nested ifs instead of continue, so every lane reaches the group step below.
+
+@@ constexpr int MMAS_PER_WARP = WARP_SIZE / MMA_M;
+Warps are 32 threads, but we can't actually do a matrix multiply on all 32 pixels at once due to the `MMA_M` size constraint. As such, we must perform `MMAS_PER_WARP` matrix multiplies to get values for all 32 pixels.
+
+@@ float acc[MMAS_PER_WARP][MMAS_PER_WIDTH][C_VALS_PER_LANE];
+Each lane holds part of its warp's output. But which part? And where on Earth does this shape come from?
+
+A warp renders 32 pixels for its block's `WIDTH` channels, so it'll owe a `32 pixels x WIDTH channels` output. That's `WIDTH` channels per lane, which in the scalar kernel (see commit history), a lane simply owned. With tensor cores the split is... not so nice...
+
+One `mma.m16n8k8` produces `16 pixels x 8 channels`, so the warp's output is tiled from several of them:
+- `MMAS_PER_WARP = 32 / 16 = 2` tiles stacked down cover the pixels.
+- `MMAS_PER_WIDTH = WIDTH / 8` tiles side by side cover the channels.
+- Each mma tile's 128 output values are distributed to lanes. So, `C_VALS_PER_LANE = 128 / 32 = 4`.
+
+So `acc[m][j][i]` is value `i` of this lane's share of the tile `m` down and `j` across. Which pixels and channels those are is fixed by the `C` fragment layout (see the output write).
+
+@@ __shared__ int s_slots[BLOCK_SIZE / WARP_SIZE][MMA_K];
+This keeps track of which of the `MMA_K` gaussians a given warp is working with, since warp culling allows warps to operate on gaussians independently.
+
+@@ constexpr int A_VALS_PER_LANE = MMA_M * MMA_K / WARP_SIZE;
+Tensor cores will take `A: m x k` and `B: k x n` as inputs to provide a `C: m x n` output. The matrix values are split among registers within a warp, so this tells us how many values each lane within the warp holds for `A` and `C`.
+
+<TO BE FILLED IN: WHY NO `B_VALS_PER_LANE`>
+
+@@ constexpr int MMA_M = 16;
+Shape of one mma.m16n8k8, rows (pixels) by columns (channels) by inner dimension (gaussians).
+
+@@ __shared__ float s_w[BLOCK_SIZE / WARP_SIZE][MMA_K * W_STRIDE];
+To fill up the tensor core matrices, we will accumulate the per-pixel-gaussian weights for numerous gaussians. In this case, `BLOCK_SIZE / WARP_SIZE` is the number of warps in the block (since each warp operates independently). `MMA_K * W_STRIDE` (see their definition sidenotes) gives space for the pixel-gaussian weights.
+
+@@ constexpr int MMAS_PER_WIDTH = WIDTH / MMA_N;
+Tensor cores require a fixed shape. On a NVIDIA L4 with the particular core we will be using, it's `M=16, N=8, K=8` where the matrix inputs `A` and `B` are $M \times K$ and $K \times N$, respectively.
+
+The cores are ultimately going to compute `32 pixels x 8 weights @ 8 gaussians x WIDTH channels` (the warp's local output). But, because `K=8` does not necessarily equal width, we'll have to split it into a few separate MMAs. Luckily, channels are completely independent. We can just perform `WIDTH / K` multiplies.
+
 @@ __device__ inline int2 warp_pixel(int warp, int lane) {
 When performing warp culling, we use this function to ensure warp boxes are `8x4`. Why? It is the rectangle of area 32 with the smallest perimeter at 24. 
 
-The worst case for a warp during is having a gaussian touch the edge. The whole warp must pursue a gaussian that only one of its pixels will touch. Minimizing the perimeter minimizes the size of the edge, so this change is mostly a theoretical "correctness". In practice, the observed speedup is small like 3-9%. But it does see 12.5% fewer passes (on the truck scene) on average... Always feels good when theory works.
+The worst case for a warp during is having a gaussian touch the edge. The whole warp must pursue a gaussian that only one of its pixels will touch. Minimizing the perimeter minimizes the size of the edge, so this change is mostly a theoretical "correctness". In practice, the observed speedup is small like 3-9%. But it does see 12.5% fewer passes (on the truck scene) on average... Always feels good when intuition works.
 
 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 For long feature vectors (e.g., 512 dimensions), it is expensive on occupancy to stage the entire vector in shared memory. For a batch of 64 Gaussians, 64 Gaussians * 512 features / gaussian * 4 bytes / features = 131kb. Each SM only has 100kb total, so you can see how this becomes a problem... `WIDTH` splits up channels over blocks. When `WIDTH = 128`, and features are 512d, 4 blocks will each work on 128d of the feature vector simultaneously. Now, in SMEM: 64 Gaussians * 128 features / gaussian * 4 bytes / feature = 33kb. Far better, we can actually fit multiple blocks at this rate.
@@ -146,3 +257,75 @@ Cooperatively load `dL/dpixel` into registers s.t. each thread grabs multiple ch
 Remember that, when D >= 1, we render two images of shape `[H, W, 3]` (the rgb image) and `[H, W, D]` (the feature map). We are, in this kernel, only concerned with pixels from the second.
 
 Parallelism: Warp level. Each warp is responsible for 32 pixels, so that's why we iterate over 32 values of `p`. Each thread in this section is assigned particular channels of `dL/dpixel` to track, which it does so across all the warp's pixels.
+
+@@ for (int i = 0; i < C_VALS_PER_LANE; i++) {
+Each iteration will write an output. A lane holds 64 values: 16 channels across 4 pixels. Thanks to `column_channel`, they *are not* scattered. They form 8 runs of 8 contiguous channels that each belong to one pixel. Consider lane 5:
+
+| pixel | runs |
+| ----- | ---- |
+| 1     | ch 16-23, ch 24-31 |
+| 9     | ch 16-23, ch 24-31 |
+| 17    | ch 16-23, ch 24-31 |
+| 25    | ch 16-23, ch 24-31 |
+
+The loop is two levels: the outer `m` and `i` pick a run (`2 x 4 = 8` of them), and the inner loop will write it. `m` is the tile down (pixels 0-15 or 16-31). `i` is one of this lane's 4 C values per tile, `i / 2` picks which of its 2 rows (pixels) and `i % 2` which of its 2 columns.
+
+@@ int2 p = warp_pixel(warp, fragment_pixel(m, i / C_COLS_PER_LANE, lane));
+`fragment_pixel` turns (tile down, which row) into the warp pixel 0-31, and `warp_pixel` turns that into x, y inside the tile. For lane 5 and `m = 0`:
+- `i = 0, 1` land on pixel 1.
+- `i = 2, 3` land on pixel 9.
+
+@@ dst[q] = make_float4(acc[m][j][i], acc[m][j + 1][i], acc[m][j + 2][i], acc[m][j + 3][i]);
+Four `acc` values in a row become one `float4` of output. But why are those four values adjacent channels? To see it, we first need to remember what `acc[m][j][i]` holds.
+
+- `m`: which `mma` down. The warp's 32 pixels take two stacked tiles, so this is pixels 0-15 or 16-31.
+- `j`: which `mma` across. Each covers 8 of the slice's channels.
+- `i`: one `mma` writes 128 values, and each of the 32 lanes only gets 4 of them. `i` picks which of the 4.
+
+Which 4, though? That's NVIDIA's call, not ours. From the layout diagram (see `fragment_pixel`), a lane shows up in 4 cells of every tile: 2 rows 8 apart, and 2 adjacent columns. Lane 5, for example:
+
+```
+            col 2   col 3
+row 1       i = 0   i = 1
+row 9       i = 2   i = 3
+```
+
+So `i / 2` says top or bottom row (which pixel), and `i % 2` says left or right column.
+
+Now hold `m` and `i` fixed. We're on the same pixel and the same column `c` in every tile across, only `j` changes. So which channel is column `c` of the j-th `mma`? That one *is* our choice. The B load fed column `c` of `mma` `j` from channel `8c + j` (see `column_channel`), and since C's column `c` is just `A . B[:, c]`, it carries that same channel.
+
+```
+acc[m][j][i]  ->  channel  8c + j,   c = 2 * lane_in_group + i % 2
+```
+
+Each step in `j` is one channel over. Four in a row is a `float4`, and two of them cover all 8 channels of that column. With the "natural" mapping (`8j + c`), a lane would instead hold pairs of channels spaced 8 apart... 8 `float2` stores per pixel instead of 4 `float4`s.
+
+@@ const float* row0 = feat + slots[lane_in_group] * WIDTH + channel;
+Time to hand the tensor core its `B`, the features. Per `mma`, `B` is 8 gaussians (rows) by 8 channels (columns), and each lane only supplies 2 of those 64 values. Which 2? NVIDIA's `B` layout says both sit in column `group_id`, one on row `lane_in_group` and one on row `lane_in_group + 4`:
+
+| value | `B` row (gaussian in the group) | `B` column |
+| ----- | ------------------------------- | ---------- |
+| `b0`  | `lane_in_group` (0-3)           | `group_id` |
+| `b1`  | `lane_in_group + 4` (4-7)       | `group_id` |
+
+So `row0` points at that first gaussian's feature row in `s_feat` (`slots` says where it was staged), and `row1` at the second. The `+ channel` jumps to this lane's column. Lane 5 (`group_id = 1`, `lane_in_group = 1`) reads group gaussians 1 and 5, both starting at channel 8.
+
+@@ float4 v0 = reinterpret_cast<const float4*>(row0)[q];
+But that's one column of one `mma`. We run `MMAS_PER_WIDTH` of them across, and the lane needs its column in every one. Thanks to `column_channel`, column `group_id` of the j-th `mma` is channel `8 * group_id + j`, so across all `j` the lane's values are 8 channels in a row. That's two `float4` loads per row instead of 8 scalar ones, and `b0[j]` ends up being exactly the value the j-th `mma` wants.
+
+@@ const float* w0 = w + lane_in_group * W_STRIDE;
+Now `A`, the weights. Per `mma`, `A` is 16 pixels (rows) by 8 gaussians (columns), and each lane supplies 4 values. NVIDIA's `A` layout puts them on columns `lane_in_group` and `lane_in_group + 4`, and on rows `group_id` and `group_id + 8`.
+
+Notice anything? The lane's `A` columns are the same two gaussians as its `B` rows. That's no accident, it's the shared `k` dimension lining up. So `w0` and `w1` are the weight rows (one per gaussian, see `s_w`) for those two gaussians.
+
+@@ float a[A_VALS_PER_LANE] = {w0[p0], w0[p1], w1[p0], w1[p1]};
+And the rows of `A` are pixels, the same two rows the lane holds in `C` (see `fragment_pixel`). Picking those two pixels out of both gaussians' weight rows gives the 4 values, in the order PTX expects:
+
+| value  | pixel (row) | gaussian (column)   |
+| ------ | ----------- | ------------------- |
+| `a[0]` | `p0`        | `lane_in_group`     |
+| `a[1]` | `p1`        | `lane_in_group`     |
+| `a[2]` | `p0`        | `lane_in_group + 4` |
+| `a[3]` | `p1`        | `lane_in_group + 4` |
+
+Unlike `B`, `A` doesn't change across `j`. Every `mma` across uses the same weights, only the channels differ, so we build `a` once per `m` and reuse it.
