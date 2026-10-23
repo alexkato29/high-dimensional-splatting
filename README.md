@@ -59,3 +59,7 @@ scene/
 ```
 
 You can download pre-processed COLMAP datasets from [here](https://demuc.de/colmap/datasets/).
+
+## License
+
+[Apache 2.0](LICENSE), applying to all versions of this repository, including commits made before the change from MIT. See [NOTICE](NOTICE).

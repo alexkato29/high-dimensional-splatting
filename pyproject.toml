@@ -5,7 +5,7 @@ description = "Minimal implementation of 3DGS"
 authors = [
     {name = "Alex Katopodis"}
 ]
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
