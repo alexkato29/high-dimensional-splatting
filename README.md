@@ -11,9 +11,9 @@ We implement the core 3DGS rasterization algorithm entirely from scratch, includ
 - PyTorch bindings to support python-hosted training and inference integration.
 - A training pipeline with COLMAP dataset ingestion.
 
-Of emphasis is the performance on high-dimensional features, where we implement a novel algorithm to handle `{32, 64, 128, 256, 512}` dimensional vectors, with a natural extension to higher dimensions available. Unlike compression (proposed by Feature3DGS) or downsampling (proposed by [Quantile Rendering](https://arxiv.org/abs/2512.20927)) techniques, this algorithm computes every dimension with precision on the order of TF32 rounding error. Performance is meaningfully improved over the official nerfstudio `gsplat` implementation with outputs matching within that tolerance.
+Of emphasis is the performance on high-dimensional features, handling `{32, 64, 128, 256, 512}` dimensional vectors with a natural extension to higher dimensions available. Unlike compression (proposed by Feature3DGS) or blending only a subset of gaussians per ray (proposed by [Quantile Rendering](https://arxiv.org/abs/2512.20927)), every contributing gaussian is blended at full dimensionality. The forward pass blends on TF32 tensor cores. Concurrent work by [Zhang et al. (NeurIPS 2026)](https://openreview.net/forum?id=PHnQZyfoZ1) describes a related tensor-core approach in its abstract, though their full paper is not yet available as of October 23rd, 2026. The backward pass uses a novel layout: each lane owns a slice of channels across its warp's pixels, so feature gradients accumulate within a lane with no cross-lane reduction. Performance is meaningfully improved over the official nerfstudio `gsplat` implementation, with outputs matching within TF32 rounding tolerance.
 
-*Algorithmic paper coming soon.*
+*Algorithmic writeup coming soon.*
 
 ## Performance
 
