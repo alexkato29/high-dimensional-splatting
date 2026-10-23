@@ -1,5 +1,5 @@
 @@ asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
-Tensor cores on the L4 operate on tf32 representations of floats. The difference: fp32 has 23 mantissa bits, tf32 has 10. To convert, the values are truncated. That meaningfully increased error of our renderings compared to the oracle. While it's intuitive why (truncation always biases to round down), the math is still interesting.
+Tensor cores on the L4 operate on tf32 representations of floats. The difference: fp32 has 23 mantissa bits, tf32 has 10. Handing the tensor core raw fp32 bits truncates them, which meaningfully increased the error of our renderings compared to the oracle. This line rounds to nearest instead. While it's intuitive why truncation hurts (it always biases to round down), the math is still interesting.
 
 I won't cover the exact math here, but this table has the gist:
 
@@ -34,7 +34,7 @@ Then the operands, each a brace list of this lane's registers:
 - `{%8,%9}`: this lane's 2 values of `B`.
 - `{%0,%1,%2,%3}` again: the accumulator `C`. Same registers as `D`, so the result adds onto `c` in place, `c = a . b + c`.
 
-The lines below bind those `%` numbers to our variables. `"+f"` means a float register that is both read and written, which is exactly what an accumulator is. `"r"` means a plain 32-bit register, and `__float_as_uint` hands over the float's raw bits without converting anything. Why bits? PTX takes TF32 operands as 32-bit patterns and the tensor core only reads the top 19 of them (sign, exponent, 10 mantissa bits). The low 13 bits are simply ignored, which is the truncation behind any observed error. `volatile` just tells the compiler not to drop or merge the instruction.
+The lines below bind those `%` numbers to our variables. `"+f"` means a float register that is both read and written, which is exactly what an accumulator is. `"r"` means a plain 32-bit register, and `__float_as_uint` hands over the float's raw bits without converting anything. Why bits? PTX takes TF32 operands as 32-bit patterns and the tensor core only reads the top 19 of them (sign, exponent, 10 mantissa bits). The low 13 bits are simply ignored, which is why we round to nearest beforehand (see `to_tf32`). `volatile` just tells the compiler not to drop or merge the instruction.
 
 @@ float b0[MMAS_PER_WIDTH], b1[MMAS_PER_WIDTH];
 This matmul will perform `A @ B = C`. Each lane loads 2 values of `B` per matmul (since `B` holds 64 values and there are 32 lanes). `b0` and `b1` will ultimately store those 2 values, for each of the `MMAS_PER_WIDTH` matmuls.
@@ -108,8 +108,6 @@ This keeps track of which of the `MMA_K` gaussians a given warp is working with,
 @@ constexpr int A_VALS_PER_LANE = MMA_M * MMA_K / WARP_SIZE;
 Tensor cores will take `A: m x k` and `B: k x n` as inputs to provide a `C: m x n` output. The matrix values are split among registers within a warp, so this tells us how many values each lane within the warp holds for `A` and `C`.
 
-<TO BE FILLED IN: WHY NO `B_VALS_PER_LANE`>
-
 @@ constexpr int MMA_M = 16;
 Shape of one mma.m16n8k8, rows (pixels) by columns (channels) by inner dimension (gaussians).
 
@@ -119,7 +117,7 @@ To fill up the tensor core matrices, we will accumulate the per-pixel-gaussian w
 @@ constexpr int MMAS_PER_WIDTH = WIDTH / MMA_N;
 Tensor cores require a fixed shape. On a NVIDIA L4 with the particular core we will be using, it's `M=16, N=8, K=8` where the matrix inputs `A` and `B` are $M \times K$ and $K \times N$, respectively.
 
-The cores are ultimately going to compute `32 pixels x 8 weights @ 8 gaussians x WIDTH channels` (the warp's local output). But, because `K=8` does not necessarily equal width, we'll have to split it into a few separate MMAs. Luckily, channels are completely independent. We can just perform `WIDTH / K` multiplies.
+The cores are ultimately going to compute `32 pixels x 8 weights @ 8 gaussians x WIDTH channels` (the warp's local output). But, because `N=8` does not necessarily equal width, we'll have to split it into a few separate MMAs. Luckily, channels are completely independent. We can just perform `WIDTH / N` multiplies.
 
 @@ __device__ inline int2 warp_pixel(int warp, int lane) {
 When performing warp culling, we use this function to ensure warp boxes are `8x4`. Why? It is the rectangle of area 32 with the smallest perimeter at 24. 
@@ -218,7 +216,7 @@ Parallelism: Warp level. We must cull gaussians that no lane will ultimately int
 
 @@ for (int i = tid; i < batch_count * VEC4_PER_SLICE; i += BLOCK_SIZE) {
 Loads `WIDTH` feature values for the `BATCH` gaussians. This loop is a bit complicated to wrap your head around at first... Recall:
-- `RENDER_BATCH` is the number of pixels in a tile.
+- `BLOCK_SIZE` is the number of pixels in a tile.
 - `BATCH` is the number of gaussians we are trying to cover right now.
 - `VEC4_PER_SLICE = WIDTH / 4` is the amount of float4s we must load to have `WIDTH` channels.
 
@@ -247,7 +245,7 @@ A for each `BATCH` of gaussians in `num_todo`. `num_todo` is just the total numb
 @@ for (int i = tid; i < batch_count; i += BLOCK_SIZE) {
 Cooperatively load a `BATCH` of gaussians (from deepest to shallowest) into shared memory.
 
-Parallelism: Thread level. One thread takes care of one gaussian, so we can load up to `TILE_SIZE * TILE_SIZE = RENDER_BATCH` at a time.
+Parallelism: Thread level. One thread takes care of one gaussian, so we can load up to `TILE_SIZE * TILE_SIZE = BLOCK_SIZE` at a time.
 
 @@ if (tid == 0) s_last_contributor = 0;
 `s_last_contributor` is shared across the tile. Why use `tid == 0`? 
