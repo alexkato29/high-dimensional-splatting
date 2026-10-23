@@ -1,7 +1,7 @@
 [project]
 name = "gaussian_splatting"
 version = "0.1.0"
-description = "Minimal implementation of 3DGS"
+description = "Efficient Gaussian Splatting in High Dimensions"
 authors = [
     {name = "Alex Katopodis"}
 ]

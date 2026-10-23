@@ -1,4 +1,4 @@
-# Gaussian Splatting in High Dimensions
+# Efficient Gaussian Splatting in High Dimensions
 
 A unique, efficient, and minimal implementation of [3D Gaussian Splatting for Real-Time Radiance Field Rendering](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), built from scratch with custom CUDA kernels. We handle high dimensional feature vectors *without* compression or downsampling of dimensionality, motivated by [Feature3DGS](https://arxiv.org/abs/2312.03203). Feature images match an FP32 reference to within `1e-3`, the rounding error of the TF32 tensor cores used in the blend. Feature gradients match to FP32 rounding error, and are computed in full FP32.
 
