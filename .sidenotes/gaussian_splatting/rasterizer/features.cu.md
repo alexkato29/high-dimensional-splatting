@@ -20,7 +20,7 @@ With tensor cores, all lanes stay involved during all blends (since MMAs are war
 @@ asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
 Absolute unit of an instruction... First, why are we writing inline assembly? Well, the CUDA tensor core API `WMMA` isn't really flexible enough to do what we are trying to do here. It loads each matrix with one fixed stride, and its register layouts are hidden. Our `B` rows are whichever gaussians happened to be heavy, scattered around `s_feat`, and the whole column mapping trick depends on knowing exactly which lane holds what. PTX gives us both.
 
-What is this instruction actually say? Reading the name left to right:
+What does this instruction actually say? Reading the name left to right:
 
 - `mma.sync.aligned`: a matrix multiply-accumulate that the whole warp executes together, so all 32 lanes must reach it at once (hence all the care to avoid divergence before it).
 - `m16n8k8`: the shape. `A` is 16 x 8, `B` is 8 x 8, and the output is 16 x 8.
@@ -49,7 +49,7 @@ This is at a per-pixel level, and we wouldn't want multiple blocks to potentiall
 Map that column to a channel, but remember that the block starts at `channel0`.
 
 @@ return n * MMAS_PER_WIDTH + j;
-Unfortunately, this line has deceptively large implications... The idea of this function is to map column n in the j-th mma across to one channel. You would think it'd would be as simple as: `j * MMAS_PER_WIDTH + n`, which would map column `i` to channel `i`. But, notice that the actual function swaps `j` and `n`... The channels are actually ordered like:
+Unfortunately, this line has deceptively large implications... The idea of this function is to map column n in the j-th mma across to one channel. You would think it would be as simple as: `j * MMAS_PER_WIDTH + n`, which would map column `i` to channel `i`. But, notice that the actual function swaps `j` and `n`... The channels are actually ordered like:
 
 |           | col 0 | col 1 | … | col 7 |
 | --------- | ----- | ----- | - | ----- |
@@ -122,7 +122,7 @@ The cores are ultimately going to compute `32 pixels x 8 weights @ 8 gaussians x
 @@ __device__ inline int2 warp_pixel(int warp, int lane) {
 When performing warp culling, we use this function to ensure warp boxes are `8x4`. Why? It is the rectangle of area 32 with the smallest perimeter at 24. 
 
-The worst case for a warp during is having a gaussian touch the edge. The whole warp must pursue a gaussian that only one of its pixels will touch. Minimizing the perimeter minimizes the size of the edge, so this change is mostly a theoretical "correctness". In practice, the observed speedup is small like 3-9%. But it does see 12.5% fewer passes (on the truck scene) on average... Always feels good when intuition works.
+The worst case for a warp is having a gaussian touch the edge. The whole warp must pursue a gaussian that only one of its pixels will touch. Minimizing the perimeter minimizes the size of the edge, so this change is mostly a theoretical "correctness". In practice, the observed speedup is small like 3-9%. But it does see 12.5% fewer passes (on the truck scene) on average... Always feels good when intuition works.
 
 @@ __global__ void __launch_bounds__(BLOCK_SIZE) render_features(
 For long feature vectors (e.g., 512 dimensions), it is expensive on occupancy to stage the entire vector in shared memory. For a batch of 64 Gaussians, 64 Gaussians * 512 features / gaussian * 4 bytes / features = 131kb. Each SM only has 100kb total, so you can see how this becomes a problem... `WIDTH` splits up channels over blocks. When `WIDTH = 128`, and features are 512d, 4 blocks will each work on 128d of the feature vector simultaneously. Now, in SMEM: 64 Gaussians * 128 features / gaussian * 4 bytes / feature = 33kb. Far better, we can actually fit multiple blocks at this rate.
@@ -165,16 +165,16 @@ Parallelism: Each thread is working on a subset of the final channels for a part
 Static shared memory arrays are capped to 48kb on an L4, but it allows up to 99 KB per block through a dynamic allocation. With `WIDTH = 64` and `BATCH = 128` a block stages 32 KB, so shared memory allows two blocks per SM, the same as registers.
 
 @@ atomicAdd(&grad_features[(size_t)gaussian_id * D + channel0 + lane + WARP_SIZE * i], dL_df);
-Because there are no vectorized atomics on the L4 GPU (which I wrote this on), we unfortunately must write each each gradient individually. Each lane, at this point, writes all the channels it was responsible for.
+Because there are no vectorized atomics on the L4 GPU (which I wrote this on), we unfortunately must write each gradient individually. Each lane, at this point, writes all the channels it was responsible for.
 
 
 @@ for (int p = 0; p < WARP_SIZE; p++) w[p] = s_weight[warp * WARP_SIZE + p];
 This is a sync to ensure that all 32 lanes in a warp hold all 32 weight values, which were computed per thread.
 
 @@ float total = reduce_scatter<8, WARP_SIZE>(v, lane);
-`total` holds all partial derivates summed across the whole warp. for 0<=k<=5, each lane 4k to 4k + 3 holds one of the derivatives. They're repeated since the reduce scatter is undersaturated given its template parameters.
+`total` holds all partial derivatives summed across the whole warp. for 0<=k<=5, each lane 4k to 4k + 3 holds one of the derivatives. They're repeated since the reduce scatter is undersaturated given its template parameters.
 
-Since each is repeated 4 times, we perform `k = lane >> 2` to divide it by 4. This gives tells us which lane holds which derivative.
+Since each is repeated 4 times, we perform `k = lane >> 2` to divide it by 4. This tells us which lane holds which derivative.
 
 
 @@ float dL_dG = c.w * dL_dalpha;
